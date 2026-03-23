@@ -17,13 +17,12 @@ from loguru import logger
 from dotenv import load_dotenv
 
 from src.content_generation.prompt_builder import (
-    build_synthesis_prompt,
-    detect_story_type,
-    extract_source_digest,
-    resolve_dateline,
-    extract_newsworthiness_signals,
+    extract_article_signals,
+    detect_story_type_v2,
+    build_synthesis_prompt_v2,
+    validate_article_v2,
     parse_generated_article,
-    SYSTEM_MESSAGE,
+    SYSTEM_MESSAGE_V3,
 )
 
 # Add project root to path
@@ -71,79 +70,6 @@ def get_groq_client():
         return None
 
 
-
-
-
-def validate_topic_focus(article: Dict, topic: str, source_articles: List[Dict]) -> Dict:
-    """
-    Validate that the generated article stays focused on the main topic.
-    
-    Checks for potential topic drift by looking for unrelated content.
-    
-    Args:
-        article: Generated article dictionary
-        topic: Main topic name
-        source_articles: Original source articles
-        
-    Returns:
-        Dictionary with validation results
-    """
-    story_lower = article.get('story', '').lower()
-    heading_lower = article.get('heading', '').lower()
-    topic_lower = topic.lower()
-    
-    # Common unrelated topic indicators
-    unrelated_signals = {
-        'sports': ['tennis', 'football', 'basketball', 'cricket', 'match', 'tournament', 
-                  'championship', 'semifinals', 'finals', 'player', 'scored', 'defeated'],
-        'entertainment': ['movie', 'film', 'actor', 'actress', 'celebrity', 'album', 
-                         'concert', 'performance', 'singer', 'artist'],
-        'conflict': ['war', 'military', 'conflict', 'gaza', 'ukraine', 'soldiers', 
-                    'bombing', 'attack', 'humanitarian crisis'],
-        'politics': ['election', 'government', 'president', 'parliament', 'minister', 
-                    'political party', 'vote', 'legislation'],
-        'weather': ['storm', 'hurricane', 'weather', 'temperature', 'forecast', 
-                   'precipitation', 'climate pattern']
-    }
-    
-    # Determine main topic category from the topic name
-    main_category = None
-    for category, keywords in unrelated_signals.items():
-        if any(kw in topic_lower for kw in keywords):
-            main_category = category
-            break
-    
-    if not main_category:
-        # Generic topic - less strict validation
-        return {'is_focused': True, 'warnings': []}
-    
-    # Check for keywords from OTHER categories
-    warnings = []
-    detected_categories = set()
-    
-    for category, keywords in unrelated_signals.items():
-        if category == main_category:
-            continue
-            
-        # Check if unrelated keywords appear in the article
-        found_keywords = [kw for kw in keywords if kw in story_lower or kw in heading_lower]
-        
-        if found_keywords:
-            detected_categories.add(category)
-            warnings.append(f"⚠️ Detected {category} content: {', '.join(found_keywords[:3])}")
-    
-    is_focused = len(detected_categories) == 0
-    
-    if not is_focused:
-        logger.warning(f"Topic drift detected in article about '{topic}':")
-        for warning in warnings:
-            logger.warning(f"  {warning}")
-    
-    return {
-        'is_focused': is_focused,
-        'warnings': warnings,
-        'detected_categories': list(detected_categories)
-    }
 
 
 
@@ -211,7 +137,8 @@ def generate_article(
     Generate a comprehensive article from a trend cluster using Groq API.
     
     Takes multiple source articles about a topic and synthesizes them
-    into one well-structured, comprehensive news article.
+    into one well-structured, comprehensive news article using the V2
+    signal-routed prompt pipeline.
     
     Args:
         trend: Trend dictionary with 'topic', 'articles', and 'keywords'.
@@ -228,6 +155,8 @@ def generate_article(
         - sources_used: List of source names
         - word_count: Final word count
         - source_count: Number of source articles used
+        - story_type: Detected story type name string
+        - validation_warnings: List of warning strings (empty if none)
         
     Example:
         >>> article = generate_article(trend_data, target_words=800)
@@ -252,27 +181,57 @@ def generate_article(
         logger.warning("Groq client unavailable, using fallback")
         return generate_fallback_article(trend)
     
-    # Build prompt — dateline resolved once, shared by prompt and metadata
-    system_msg, user_prompt, dateline, story_type = build_synthesis_prompt(
-        articles=source_articles,
-        topic=topic,
-        target_words=target_words,
-        include_subheadings=include_subheadings,
-    )
+    # Pre-processing: extract signals and detect story type (deterministic —
+    # run once before retry loop, no value in repeating on retry)
+    signals = extract_article_signals(source_articles)
+    story_type_config = detect_story_type_v2(source_articles, topic, signals)
     
     # Dynamic max_tokens based on target word count
     max_tokens = min(2300, int(target_words * 1.45) + 300)
     
     logger.info(f"🖊️ Generating article for trend: '{topic}'")
     logger.info(f"   Sources: {len(source_articles)} articles")
-    logger.info(f"   Story type: {story_type.name}")
+    logger.info(f"   Story type: {story_type_config.get('name', 'general')}")
     
     # Attempt generation with retries
-    for attempt in range(max_retries):
+    # NOTE: 'attempt' is a manual counter (not a for-loop variable) so that
+    # rate-limit waits do NOT consume a retry slot. Every code path that
+    # represents a real failure increments attempt explicitly. Rate limit
+    # hits sleep and loop back without incrementing.
+    attempt = 0
+    while attempt < max_retries:
         try:
+            # Build prompt inside retry loop (dateline may change between
+            # attempts if the clock rolls over, and this keeps it clean)
+            system_msg, user_prompt, dateline, _story_type = build_synthesis_prompt_v2(
+                articles=source_articles,
+                topic=topic,
+                signals=signals,
+                story_type_config=story_type_config,
+                target_words=target_words,
+                include_facts_snapshot=include_subheadings,
+            )
+
             # Call Groq API
             model = os.getenv('GROQ_MODEL', 'llama3-70b-8192')
-            
+            # ── Prompt debug capture ──
+            prompt_debug = {
+                "model": model,
+                "system_msg": system_msg,
+                "user_prompt": user_prompt,
+                "total_word_estimate": len(user_prompt.split()) + len(system_msg.split()),
+                "story_type": story_type_config.get("name", "general"),
+                "topic": topic,
+                "source_count": len(source_articles),
+                "attempt": attempt + 1,
+                "captured_at": datetime.utcnow().isoformat(),
+            }
+            logger.info(
+                f"Prompt built — model: {model} | "
+                f"~{prompt_debug['total_word_estimate']} words | "
+                f"story type: {prompt_debug['story_type']}"
+            )
+
             response = client.chat.completions.create(
                 model=model,
                 messages=[
@@ -283,65 +242,98 @@ def generate_article(
                 max_tokens=max_tokens,
                 top_p=0.9,
             )
-            
+
             # Extract generated content
             generated_text = response.choices[0].message.content
-            
+
             if not generated_text:
                 logger.warning(f"Empty response from Groq (attempt {attempt + 1})")
+                attempt += 1
                 continue
-            
+
             # Parse article
             article = parse_generated_article(generated_text)
-            
-            # Validate
+            article["prompt_debug"] = prompt_debug
+
+            # Basic length check before full validation
             word_count = len(article['story'].split())
-            
+
             if word_count < 300:
                 logger.warning(f"Article too short ({word_count} words), retrying...")
+                attempt += 1
                 continue
-            
+
+            # V2 post-generation validation
+            validation = validate_article_v2(article, topic, signals, story_type_config)
+
+            if not validation["passes"]:
+                for failure in validation["failures"]:
+                    logger.warning(f"Article validation failure: {failure}")
+                if attempt < max_retries - 1:
+                    attempt += 1
+                    continue
+                else:
+                    logger.error(
+                        "Article failed validation after all retries — returning None"
+                    )
+                    return None
+
+            # Log warnings (do not block upload)
+            for warning in validation.get("warnings", []):
+                logger.warning(f"Article validation warning: {warning}")
+
             # Add metadata
             article.update({
-                "dateline":     dateline,
-                "topic":        topic,
-                "timestamp":    format_timestamp(),
-                "sources_used": list({a.get("source_name", "Unknown") for a in source_articles}),
-                "source_count": len(source_articles),
-                "word_count":   len(article["story"].split()),
-                "keywords":     trend.get("keywords", [])[:10],
-                "generated_at": datetime.utcnow().isoformat(),
-                "model_used":   model,
-                "story_type":   story_type.name,
+                "dateline":             dateline,
+                "topic":                topic,
+                "timestamp":            format_timestamp(),
+                "sources_used":         list({a.get("source_name", "Unknown") for a in source_articles}),
+                "source_count":         len(source_articles),
+                "word_count":           len(article["story"].split()),
+                "keywords":             trend.get("keywords", [])[:10],
+                "generated_at":         datetime.utcnow().isoformat(),
+                "model_used":           model,
+                "story_type":           story_type_config.get("name", "general"),
+                "validation_warnings":  validation.get("warnings", []),
             })
-            
+
             logger.info(f"✅ Generated article: '{article['heading'][:50]}...'")
             logger.info(f"   Word count: {article['word_count']}")
             logger.info(f"   Dateline: {article['dateline']}")
-            
+
             return article
-            
+
         except Exception as e:
             error_msg = str(e)
-            
-            # Handle rate limiting
+
+            # ── Rate limit: wait and retry WITHOUT consuming a retry slot ──
+            # Groq returns 429 when the per-minute token quota is exceeded.
+            # Sleep 65s to let the 60s window reset, then retry the same
+            # attempt index. attempt is NOT incremented here — this is
+            # intentional and the core of this fix.
             if '429' in error_msg or 'rate' in error_msg.lower():
-                wait_time = 60 * (attempt + 1)  # Exponential backoff
-                logger.warning(f"Rate limited, waiting {wait_time}s...")
-                time.sleep(wait_time)
-                continue
-            
-            # Handle timeout
+                logger.warning(
+                    f"⏳ Rate limited by Groq — waiting 65s for quota reset "
+                    f"(attempt {attempt + 1}/{max_retries} preserved, "
+                    f"retry slot NOT consumed)..."
+                )
+                time.sleep(65)
+                continue  # ← no attempt += 1 here, by design
+
+            # ── Groq timeout: counts as an attempt ──
             if 'timeout' in error_msg.lower():
-                logger.warning(f"Timeout on attempt {attempt + 1}")
+                logger.warning(f"Groq API timeout on attempt {attempt + 1}")
+                attempt += 1
                 continue
-            
+
+            # ── All other errors: log and consume attempt ──
             logger.error(f"Generation error (attempt {attempt + 1}): {e}")
-            
-            if attempt == max_retries - 1:
+            attempt += 1
+
+            if attempt >= max_retries:
                 logger.error("Max retries reached, using fallback")
                 return generate_fallback_article(trend)
-    
+
     return generate_fallback_article(trend)
 
 
