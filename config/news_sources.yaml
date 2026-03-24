@@ -42,7 +42,7 @@ sources:
       headline: "h1[data-testid='Heading']"
       content: "div[data-testid='article-body']"
     priority: 1
-    enabled: true
+    enabled: false  # 401 Forbidden on every request — March 2026
     rate_limit_delay: 3
 
   - name: "Al Jazeera"
@@ -74,7 +74,7 @@ sources:
       headline: "h1.headline__text"
       content: "div.article__content"
     priority: 1
-    enabled: true
+    enabled: false  # RSS serving stale 2023 content — March 2026
     rate_limit_delay: 3
 
   - name: "The New York Times"
@@ -90,7 +90,7 @@ sources:
       headline: "h1[data-testid='headline']"
       content: "section[name='articleBody']"
     priority: 1
-    enabled: true
+    enabled: false  # Paywall blocks all content — March 2026
     rate_limit_delay: 4
 
   # ===========================================
@@ -190,7 +190,7 @@ sources:
       headline: "h1.sp-ttl"
       content: "div.sp-cn"
     priority: 2
-    enabled: true
+    enabled: false  # Empty HTML on all URLs, bot protection — disabled March 2026
     rate_limit_delay: 2
 
   - name: "The Washington Post"
@@ -206,7 +206,7 @@ sources:
       headline: "h1.headline"
       content: "article.body"
     priority: 2
-    enabled: true
+    enabled: false  # 30s timeout on every URL, paywall — disabled March 2026
     rate_limit_delay: 4
 
   - name: "Associated Press"
@@ -242,7 +242,7 @@ sources:
       headline: "h1.article__title"
       content: "div.article__content"
     priority: 3
-    enabled: true
+    enabled: false  # Insufficient content on all URLs — disabled March 2026
     rate_limit_delay: 2
 
   - name: "Deutsche Welle"

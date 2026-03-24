@@ -224,6 +224,22 @@ def run_pipeline(dry_run: bool = False) -> dict:
         for i, trend in enumerate(trends):
             logger.info(f"\n📝 Processing trend {i+1}/{len(trends)}: {trend['topic']}")
             
+            # ── Single-source guard ──
+            # Never generate from fewer than 2 source articles.
+            # A single-source article cannot be honestly synthesized
+            # to 800+ words — the model will fabricate to fill the gap.
+            source_count = len(trend.get('articles', []))
+            if source_count < 2:
+                logger.warning(
+                    f"⏭️  Skipping '{trend['topic']}' — "
+                    f"only {source_count} source(s). "
+                    f"Minimum 2 required for honest synthesis."
+                )
+                stats['errors'].append(
+                    f"Skipped (single source): {trend['topic']}"
+                )
+                continue
+            
             try:
                 # Generate article
                 target_words = int(os.getenv('ARTICLE_MIN_WORDS', 800))

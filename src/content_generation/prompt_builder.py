@@ -1,158 +1,534 @@
 """
-OSI News Automation – Prompt Builder
-=====================================
-Builds editorially-structured prompts for Groq / LLaMA article synthesis.
+OSI News Automation – Prompt Builder (V2)
+==========================================
+Builds editorially-structured prompts for Groq / LLaMA article synthesis
+using a 10-section editorial format with signal-routed content.
 
 Provides:
-    build_synthesis_prompt   – returns (system_msg, user_prompt, dateline, story_type)
-    detect_story_type        – classifies source articles into a StoryType
-    resolve_dateline         – picks the most-common source location + current date
-    extract_source_digest    – token-budgeted source digest
-    extract_newsworthiness_signals – info-quality tier guidance
-    parse_generated_article  – splits LLM output into heading / sub_heading / story
-    SYSTEM_MESSAGE           – journalist persona (system role constant)
+    extract_article_signals    – mines quotes, key facts, human angle from sources
+    detect_story_type_v2       – classifies articles into one of 8 story types
+    build_synthesis_prompt_v2  – returns (system_msg, user_prompt, dateline)
+    validate_article_v2        – hard post-generation section/quality validator
+    resolve_dateline           – LLM-first dateline with Counter fallback
+    parse_generated_article    – splits LLM output into heading / sub_heading / story
+    SYSTEM_MESSAGE_V3          – journalist persona (system role constant)
+    STORY_TYPES_V2             – 8-type story taxonomy with per-type config
 """
 
 import os
 import re
 import time
 from collections import Counter
-from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
+from loguru import logger
 
-# ───────────────────────────────────────
-# Story-type classification
-# ───────────────────────────────────────
-
-@dataclass
-class StoryType:
-    """Represents a detected story category with matching section structure."""
-    name: str
-    sections: List[str] = field(default_factory=list)
+from src.content_generation.location_extractor import extract_location_and_category
 
 
-# Pre-defined story types with recommended article sections
-_STORY_TYPES = {
-    "scientific": StoryType(
-        name="scientific",
-        sections=[
-            "The Discovery",
-            "Scientific Context",
-            "Methodology & Reliability",
-            "Expert Reception",
-            "Path Forward",
+# ═══════════════════════════════════════════════════════════════════
+# MODULE-LEVEL COMPILED REGEX PATTERNS
+# ═══════════════════════════════════════════════════════════════════
+
+# Quote extraction: captures quoted text (20–200 chars) between curly or
+# straight quote characters, optionally followed by an attribution verb
+# and a capitalised speaker name.
+#   Group 1 = quoted text
+#   Group 2 = attribution verb (optional)
+#   Group 3 = speaker name — one or more capitalised words (optional)
+_QUOTE_RE = re.compile(
+    r'[\u201c\u201d""]'           # opening quote (curly or straight)
+    r'([^"\u201c\u201d\u201e]{20,200})'  # captured quote body: 20-200 chars
+    r'[\u201c\u201d""]'           # closing quote
+    r'(?:\s*,?\s*'                # optional separator
+    r'(?:said|stated|told|confirmed|warned|added|noted|declared))?'  # attribution verb (optional non-capturing)
+    r'(?:\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*))?'  # speaker name: capitalised words (optional)
+)
+
+# Key fact patterns — three groups:
+# (a) Numeric claims with units (e.g. "500 people", "3.5 percent")
+_KEYFACT_NUMERIC_RE = re.compile(
+    r'\b(\d[\d,\.]*\s*(?:people|percent|billion|million|km|kilometers|'
+    r'kilometres|years|months|troops|soldiers|casualties|deaths|injured|'
+    r'wounded|displaced|refugees|tons|tonnes|dollars|euros|pounds))\b',
+    re.IGNORECASE,
+)
+
+# (b) Full dates with month name + day + year (e.g. "March 21, 2024")
+_KEYFACT_DATE_RE = re.compile(
+    r'\b((?:January|February|March|April|May|June|July|August|September|'
+    r'October|November|December)\s+\d{1,2},?\s+\d{4})\b'
+)
+
+# (c) Named institutions ending in key suffixes
+_KEYFACT_INSTITUTION_RE = re.compile(
+    r'\b([A-Z][A-Za-z\s]{3,40}\s+'
+    r'(?:Ministry|Government|Agency|Organisation|Organization|Authority|'
+    r'Commission|Council|Department|Bureau|Committee))\b'
+)
+
+# Sentence boundary splitter — handles .!? followed by whitespace
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
+
+# Human-angle scoring keywords
+_HUMAN_ANGLE_KEYWORDS = frozenset([
+    'family', 'families', 'children', 'child', 'civilian', 'civilians',
+    'resident', 'residents', 'community', 'communities', 'victim', 'victims',
+    'survivor', 'survivors', 'refugee', 'refugees', 'worker', 'workers',
+    'displaced', 'shelter', 'orphan', 'elderly', 'women', 'infant',
+])
+
+# Outlet name leak detection
+_OUTLET_LEAK_RE = re.compile(
+    r'\b(?:BBC|Reuters|CNN|Al\s*Jazeera|Associated\s*Press)\b',
+    re.IGNORECASE,
+)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STORY TYPE TAXONOMY — V2
+# ═══════════════════════════════════════════════════════════════════
+
+STORY_TYPES_V2: Dict = {
+    "conflict": {
+        "name": "conflict",
+        "keywords": [
+            "war", "military", "conflict", "attack", "airstrike", "bombing",
+            "soldiers", "troops", "casualties", "ceasefire", "frontline",
+            "weapons", "artillery", "invasion", "offensive", "defense",
+            "militia", "insurgent", "battle",
         ],
-    ),
-    "economic": StoryType(
-        name="economic",
-        sections=[
-            "The Economic Event",
-            "Market Response",
-            "Transmission & Impact",
-            "Policy & Intervention",
-            "Historical Context",
+        "sections": [
+            "The Military Situation",
+            "Civilian Impact",
+            "International Response",
+            "Strategic Analysis",
+            "Prospects for Resolution",
         ],
-    ),
-    "social": StoryType(
-        name="social",
-        sections=[
-            "The Shift",
-            "Who's Leading, Who's Resisting",
-            "Institutional Response",
-            "Speed & Scale",
-            "Substance Assessment",
+        "quote_instruction": (
+            "Prioritise voices from military officials, humanitarian agencies, "
+            "and affected civilians."
+        ),
+        "impact_angle": (
+            "Explore how the conflict reshapes regional alliances, refugee flows, "
+            "and energy or trade corridors."
+        ),
+    },
+    "humanitarian": {
+        "name": "humanitarian",
+        "keywords": [
+            "humanitarian", "refugee", "displaced", "aid", "relief", "famine",
+            "crisis", "shelter", "victims", "civilians", "suffering",
+            "hunger", "malnutrition", "evacuation", "rescue", "donation",
+            "volunteer", "camp", "migration",
         ],
-    ),
-    "political": StoryType(
-        name="political",
-        sections=[
+        "sections": [
+            "The Human Cost",
+            "Aid and Relief Efforts",
+            "Obstacles to Assistance",
+            "Personal Testimonies",
+            "Long-term Recovery",
+        ],
+        "quote_instruction": (
+            "Prioritise voices from aid workers, affected families, and "
+            "UN agency spokespersons."
+        ),
+        "impact_angle": (
+            "Explore how the crisis strains neighbouring countries' resources "
+            "and international aid budgets."
+        ),
+    },
+    "political": {
+        "name": "political",
+        "keywords": [
+            "election", "government", "president", "parliament", "minister",
+            "political", "legislation", "vote", "policy", "opposition",
+            "coalition", "reform", "diplomat", "sanctions", "summit",
+            "treaty", "constitution", "campaign",
+        ],
+        "sections": [
             "The Development",
             "Political Landscape",
             "Stakeholder Positions",
             "Public Reaction",
             "What Comes Next",
         ],
-    ),
-    "general": StoryType(
-        name="general",
-        sections=[
+        "quote_instruction": (
+            "Prioritise voices from elected officials, party leaders, "
+            "political analysts, and affected constituencies."
+        ),
+        "impact_angle": (
+            "Explore how this political development shifts domestic power "
+            "dynamics and international diplomatic relations."
+        ),
+    },
+    "economic": {
+        "name": "economic",
+        "keywords": [
+            "economy", "market", "gdp", "inflation", "stock", "trade",
+            "financial", "investment", "currency", "recession", "growth",
+            "employment", "industry", "revenue", "profit", "tariff",
+            "interest rate", "budget", "fiscal",
+        ],
+        "sections": [
+            "The Economic Event",
+            "Market Response",
+            "Transmission & Impact",
+            "Policy & Intervention",
+            "Historical Context",
+        ],
+        "quote_instruction": (
+            "Prioritise voices from central bank officials, finance ministers, "
+            "economists, and business leaders."
+        ),
+        "impact_angle": (
+            "Explore how this economic event affects global supply chains, "
+            "consumer prices, and investment confidence."
+        ),
+    },
+    "scientific": {
+        "name": "scientific",
+        "keywords": [
+            "study", "research", "findings", "scientist", "discovery",
+            "breakthrough", "published", "journal", "peer-reviewed",
+            "experiment", "data", "clinical", "medical", "vaccine",
+            "laboratory", "hypothesis", "genome", "technology",
+        ],
+        "sections": [
+            "The Discovery",
+            "Scientific Context",
+            "Methodology & Reliability",
+            "Expert Reception",
+            "Path Forward",
+        ],
+        "quote_instruction": (
+            "Prioritise voices from lead researchers, peer reviewers, "
+            "and independent subject-matter experts."
+        ),
+        "impact_angle": (
+            "Explore how this discovery may change clinical practice, "
+            "public health policy, or future research directions."
+        ),
+    },
+    "social": {
+        "name": "social",
+        "keywords": [
+            "trend", "social", "cultural", "generation", "adoption",
+            "behavior", "demographic", "movement", "community", "society",
+            "lifestyle", "millennials", "gen z", "viral", "protest",
+            "rights", "equality", "activism",
+        ],
+        "sections": [
+            "The Shift",
+            "Who's Leading, Who's Resisting",
+            "Institutional Response",
+            "Speed & Scale",
+            "Substance Assessment",
+        ],
+        "quote_instruction": (
+            "Prioritise voices from community organisers, sociologists, "
+            "and people directly affected by the shift."
+        ),
+        "impact_angle": (
+            "Explore how this social change influences legislation, "
+            "institutional norms, and neighbouring societies."
+        ),
+    },
+    "disaster": {
+        "name": "disaster",
+        "keywords": [
+            "earthquake", "flood", "hurricane", "tornado", "wildfire",
+            "tsunami", "landslide", "cyclone", "typhoon", "eruption",
+            "storm", "disaster", "emergency", "collapse", "destruction",
+            "devastation", "rescue", "evacuation", "death toll",
+        ],
+        "sections": [
+            "The Event",
+            "Damage and Casualties",
+            "Rescue and Response",
+            "Infrastructure Impact",
+            "Recovery Outlook",
+        ],
+        "quote_instruction": (
+            "Prioritise voices from emergency services, disaster management "
+            "agencies, and survivors."
+        ),
+        "impact_angle": (
+            "Explore how the disaster affects regional infrastructure, "
+            "insurance markets, and climate-resilience planning."
+        ),
+    },
+    "general": {
+        "name": "general",
+        "keywords": [],  # fallback — no keywords to match
+        "sections": [
             "What Happened",
             "Key Details",
             "Background & Context",
             "Reactions",
             "Looking Ahead",
         ],
-    ),
+        "quote_instruction": (
+            "Include attributed statements from the most authoritative "
+            "voices related to the story."
+        ),
+        "impact_angle": (
+            "Explore broader implications for affected communities "
+            "and relevant institutions."
+        ),
+    },
 }
 
-_KEYWORD_MAP = {
-    "scientific": [
-        "study", "research", "findings", "scientist", "discovery",
-        "breakthrough", "published", "journal", "peer-reviewed",
-        "experiment", "data", "clinical", "medical",
-    ],
-    "economic": [
-        "economy", "market", "gdp", "inflation", "stock", "trade",
-        "financial", "investment", "currency", "recession", "growth",
-        "employment", "industry", "revenue", "profit",
-    ],
-    "social": [
-        "trend", "social", "cultural", "generation", "adoption",
-        "behavior", "demographic", "movement", "community", "society",
-        "lifestyle", "millennials", "gen z", "viral",
-    ],
-    "political": [
-        "election", "government", "president", "parliament", "minister",
-        "political", "legislation", "vote", "policy", "opposition",
-        "coalition", "reform", "diplomat", "sanctions",
-    ],
-}
 
-_THRESHOLD = 3  # minimum keyword hits to trigger a category
+# ═══════════════════════════════════════════════════════════════════
+# SYSTEM MESSAGE — V3
+# ═══════════════════════════════════════════════════════════════════
+
+SYSTEM_MESSAGE_V3: str = (
+    "You are a senior international correspondent with twenty years of "
+    "field reporting experience. You write for an educated general "
+    "audience that expects accuracy, context, and prose that respects "
+    "their intelligence.\n\n"
+
+    "Before you write a single word of an article, you understand your "
+    "material. You know what you have and what you do not have. You "
+    "never fill gaps with memory or inference — you name the gap "
+    "honestly and move on. A short truthful article is always more "
+    "valuable than a long fabricated one.\n\n"
+
+    "Your articles have shape. They begin with a hook that earns the "
+    "reader's attention. They develop a central tension. They ground "
+    "abstract events in real consequences. They close on the open "
+    "question that remains — not a platitude, but the specific thing "
+    "that will determine what happens next.\n\n"
+
+    "You attribute statements to named people and institutions only "
+    "when those names appear in your source material. You never infer "
+    "a title or role from memory. If a source names a person without "
+    "stating their role, you use their name only.\n\n"
+
+    "You follow AP Style. You do not editorialize. When you offer "
+    "analysis, you label it explicitly as analysis. You never use the "
+    "words 'crucial', 'landmark', 'historic', or 'unprecedented' "
+    "unless a source uses them and you are quoting directly."
+)
 
 
-def detect_story_type(articles: List[Dict], topic: str) -> StoryType:
+# ═══════════════════════════════════════════════════════════════════
+# SIGNAL EXTRACTION
+# ═══════════════════════════════════════════════════════════════════
+
+def extract_article_signals(articles: List[Dict]) -> Dict:
     """
-    Classify a set of source articles into a StoryType.
+    Mine structured signals from source articles for prompt routing.
 
-    Scans topic + first 5 articles for category keywords.
-    Returns the best-matching StoryType, or *general* if no category
-    meets the threshold.
+    Extracts quotes, key facts, a human-angle sentence, and a
+    de-duplicated source digest from up to 8 source articles.
+
+    Args:
+        articles: List of source article dicts, each with 'story',
+                  'heading', 'source_name', 'location' keys.
+
+    Returns:
+        dict with keys:
+            quotes       – list of {"text": str, "speaker": str} dicts (max 6)
+            key_facts    – list of unique fact strings (max 10)
+            human_angle  – str (longest qualifying sentence) or ""
+            source_digest – str (formatted multi-source digest text)
+
+    Example:
+        >>> signals = extract_article_signals(source_articles)
+        >>> print(signals["quotes"][0]["text"])
     """
-    combined = topic.lower() + " "
-    for article in articles[:5]:
-        combined += article.get("heading", "").lower() + " "
-        combined += article.get("story", "")[:300].lower() + " "
+    quotes: List[Dict[str, str]] = []
+    key_facts: List[str] = []
+    human_angle: str = ""
+    human_angle_score: int = 0
+    digest_parts: List[str] = []
 
-    scores = {
-        cat: sum(1 for kw in keywords if kw in combined)
-        for cat, keywords in _KEYWORD_MAP.items()
+    usable = articles[:8]
+
+    for idx, article in enumerate(usable, 1):
+        story = article.get("story", "")
+        heading = article.get("heading", "No headline")
+        source_name = article.get("source_name", "Unknown Source")
+        location = article.get("location", "Unknown")
+
+        # ── Extract quotes ──
+        for match in _QUOTE_RE.finditer(story):
+            quote_text = match.group(1).strip()
+            speaker = match.group(2).strip() if match.group(2) else "unnamed official"
+            # De-duplicate by checking if similar text already captured
+            if not any(q["text"][:40] == quote_text[:40] for q in quotes):
+                quotes.append({"text": quote_text, "speaker": speaker})
+
+        # ── Extract key facts ──
+        for pattern in (_KEYFACT_NUMERIC_RE, _KEYFACT_DATE_RE, _KEYFACT_INSTITUTION_RE):
+            for match in pattern.finditer(story):
+                fact = match.group(1).strip()
+                if fact not in key_facts:
+                    key_facts.append(fact)
+
+        # ── Extract human angle ──
+        sentences = _SENTENCE_SPLIT_RE.split(story)
+        for sentence in sentences:
+            sentence_lower = sentence.lower()
+            score = sum(1 for kw in _HUMAN_ANGLE_KEYWORDS if kw in sentence_lower)
+            # Keep the longest sentence that has the highest keyword score
+            if score > human_angle_score or (
+                score == human_angle_score and score > 0 and len(sentence) > len(human_angle)
+            ):
+                human_angle = sentence.strip()
+                human_angle_score = score
+
+        # ── Build source digest: 800 chars per source, strip extracted quotes ──
+        cleaned_story = story
+        # Remove already-extracted quoted text to avoid duplication in digest
+        for q in quotes:
+            cleaned_story = cleaned_story.replace(q["text"], "")
+        # Also strip residual quote characters left by removal
+        cleaned_story = re.sub(r'[\u201c\u201d""]\s*[\u201c\u201d""]', '', cleaned_story)
+
+        snippet = cleaned_story[:800].strip()
+        if not snippet:
+            snippet = story[:800].strip()  # fallback to original if cleaning left nothing
+
+        digest_parts.append(
+            f"Source {idx} ({source_name}, {location}):\n"
+            f"Headline: {heading}\n"
+            f"Content: {snippet}"
+        )
+
+    # ── Cap and de-duplicate final lists ──
+    quotes = quotes[:6]
+    key_facts = key_facts[:10]
+
+    source_digest = "\n\n".join(digest_parts) if digest_parts else "(no source material)"
+
+    logger.debug(
+        f"Signal extraction: {len(quotes)} quotes, {len(key_facts)} facts, "
+        f"human_angle={'yes' if human_angle else 'no'}"
+    )
+
+    return {
+        "quotes": quotes,
+        "key_facts": key_facts,
+        "human_angle": human_angle,
+        "source_digest": source_digest,
     }
 
-    best_cat = max(scores, key=scores.get)
-    if scores[best_cat] >= _THRESHOLD:
-        return _STORY_TYPES[best_cat]
-    return _STORY_TYPES["general"]
+
+# ═══════════════════════════════════════════════════════════════════
+# STORY TYPE DETECTION — V2
+# ═══════════════════════════════════════════════════════════════════
+
+def detect_story_type_v2(
+    articles: List[Dict],
+    topic: str,
+    signals: Dict,
+) -> Dict:
+    """
+    Classify source articles into one of 8 story types using keyword
+    scoring and signal-based boosts.
+
+    Builds a combined text from the topic string and the first 400 chars
+    of each article (max 6), scores keyword hits for each type, applies
+    signal boosts, and returns the full config dict for the winning type.
+
+    Args:
+        articles: List of source article dicts.
+        topic:    Trend topic string.
+        signals:  Dict returned by extract_article_signals().
+
+    Returns:
+        Config dict from STORY_TYPES_V2 for the best-scoring type.
+        Always includes 'name', 'keywords', 'sections',
+        'quote_instruction', and 'impact_angle' keys.
+
+    Example:
+        >>> config = detect_story_type_v2(articles, "Iran conflict", signals)
+        >>> print(config["name"])  # e.g. "conflict"
+    """
+    # Build combined text for keyword scanning
+    combined = topic.lower() + " "
+    for article in articles[:6]:
+        combined += article.get("heading", "").lower() + " "
+        combined += article.get("story", "")[:400].lower() + " "
+
+    # Score each type (skip 'general' — it has no keywords and is the fallback)
+    scores: Dict[str, int] = {}
+    for type_name, config in STORY_TYPES_V2.items():
+        if type_name == "general":
+            continue
+        score = sum(1 for kw in config["keywords"] if kw in combined)
+        scores[type_name] = score
+
+    # --- Fix 2 — humanitarian and conflict boost guard ---
+    # Signal boosts are gated: only applied when keyword score already
+    # reaches threshold (>=3), preventing single-signal type overrides
+    if signals.get("human_angle") and scores.get("humanitarian", 0) >= 3:
+        scores["humanitarian"] = scores.get("humanitarian", 0) + 2
+
+    if (any("killed" in f.lower() or "wounded" in f.lower()
+            for f in signals.get("key_facts", []))
+            and scores.get("conflict", 0) >= 3):
+        scores["conflict"] = scores.get("conflict", 0) + 2
+    # --- END Fix 2 ---
+
+    # Find the winning type with minimum threshold of 2
+    best_type = max(scores, key=scores.get) if scores else "general"
+    best_score = scores.get(best_type, 0)
+
+    if best_score < 2:
+        best_type = "general"
+
+    result = STORY_TYPES_V2[best_type]
+    logger.info(f"Story type detected: {result['name']} (score={best_score})")
+    return result
 
 
-# ───────────────────────────────────────
-# Dateline resolution
-# ───────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# DATELINE RESOLUTION
+# ═══════════════════════════════════════════════════════════════════
 
 def resolve_dateline(articles: List[Dict]) -> str:
     """
-    Return an uppercase dateline string like ``NEW DELHI, March 21``.
+    Return an uppercase dateline string like ``TEHRAN, March 21``.
 
-    Picks the most-common *location* field across source articles,
-    appends the current date.  Falls back to ``NEW DELHI`` when no
-    locations are available.
+    Tries the LLM-based location extractor first for accuracy, then
+    falls back to the Counter-based approach over source location fields.
+
+    Args:
+        articles: List of source article dicts.
+
+    Returns:
+        Dateline string in "CITY, Month Day" format.
+
+    Example:
+        >>> resolve_dateline([{"location": "Tehran", "heading": "...", "story": "..."}])
+        'TEHRAN, March 22'
     """
+    # Try LLM-based location extractor first (more accurate than Counter)
+    try:
+        combined_article = {
+            "heading": articles[0].get("heading", "") if articles else "",
+            "story": " ".join(a.get("story", "")[:300] for a in articles[:3]),
+        }
+        location, _, _ = extract_location_and_category(combined_article)
+        if location and location.strip() and location.lower() not in ("unknown", "india"):
+            city = location.upper().strip()
+            now = datetime.now()
+            return f"{city}, {now.strftime('%B')} {now.day}"
+    except Exception:
+        pass  # fall through to Counter fallback
+
+    # Fallback: Counter over location fields
     locations = [
         a.get("location", "").strip()
         for a in articles
-        if a.get("location", "").strip() and a.get("location", "").strip().lower() != "unknown"
+        if a.get("location", "").strip()
+        and a.get("location", "").strip().lower() != "unknown"
     ]
 
     if locations:
@@ -164,224 +540,486 @@ def resolve_dateline(articles: List[Dict]) -> str:
     return f"{city}, {now.strftime('%B')} {now.day}"
 
 
-# ───────────────────────────────────────
-# Source digest with dynamic token budget
-# ───────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# MAIN PROMPT BUILDER — V2
+# ═══════════════════════════════════════════════════════════════════
 
-def extract_source_digest(
-    articles: List[Dict],
-    token_budget: int = 4000,
-) -> str:
-    """
-    Build a source-material digest within *token_budget* characters.
-
-    Divides the budget evenly across sources (max 10), so longer
-    article lists get shorter per-source slices instead of the old
-    hard-coded 500-char limit.
-    """
-    usable = articles[:10]
-    if not usable:
-        return "(no source material)"
-
-    per_source = max(200, token_budget // len(usable))
-    parts: List[str] = []
-
-    for i, article in enumerate(usable, 1):
-        source_name = article.get("source_name", "Unknown Source")
-        heading = article.get("heading", "No headline")
-        story = article.get("story", "")[:per_source]
-        location = article.get("location", "Unknown")
-
-        parts.append(
-            f"Source {i} ({source_name}, {location}):\n"
-            f"Headline: {heading}\n"
-            f"Content: {story}..."
-        )
-
-    return "\n\n".join(parts)
-
-
-# ───────────────────────────────────────
-# Newsworthiness / quality signals
-# ───────────────────────────────────────
-
-def extract_newsworthiness_signals(articles: List[Dict]) -> str:
-    """
-    Return an information-quality tier guide to embed in the prompt.
-    """
-    return (
-        "INFORMATION QUALITY TIERS (Apply This Filter):\n"
-        "✅ TIER 1 – MUST INCLUDE: Verified by 3+ sources, high impact, core to story\n"
-        "✅ TIER 2 – SHOULD INCLUDE: 2 sources or credible expert analysis, moderate impact\n"
-        "⚠️ TIER 3 – COULD INCLUDE: Single credible source, clearly label as preliminary\n"
-        "❌ TIER 4 – EXCLUDE: Unverified rumors, promotional content, irrelevant details"
-    )
-
-
-# ───────────────────────────────────────
-# System message (persona)
-# ───────────────────────────────────────
-
-SYSTEM_MESSAGE: str = (
-    "You are a senior wire-service journalist writing for a major international "
-    "news agency.  You write comprehensive, balanced, factual news articles by "
-    "synthesising multiple sources.  Follow AP Style.  "
-    "Each article MUST focus on ONE SINGLE TOPIC.  If sources cover unrelated "
-    "topics, identify the main topic and write EXCLUSIVELY about it.  "
-    "NEVER attribute information to specific media outlets (❌ 'BBC reported…').  "
-    "You MAY attribute to institutional actors (✅ 'The WHO confirmed…').  "
-    "Do NOT fabricate facts.  Do NOT include opinions."
-)
-
-
-# ───────────────────────────────────────
-# Prompt builder (main entry point)
-# ───────────────────────────────────────
-
-def build_synthesis_prompt(
+def build_synthesis_prompt_v2(
     articles: List[Dict],
     topic: str,
+    signals: Dict,
+    story_type_config: Dict,
     target_words: int = 800,
-    include_subheadings: bool = True,
-) -> Tuple[str, str, str, StoryType]:
+    include_facts_snapshot: bool = True,
+) -> Tuple[str, str, str, str]:
     """
-    Build a full editorial prompt for article synthesis.
+    Build a 10-section editorial prompt for article synthesis.
 
-    Returns
-    -------
-    system_msg : str
-        Persona / system-role message.
-    user_prompt : str
-        Task-specific user message with all source material.
-    dateline : str
-        Resolved dateline string (e.g. ``NEW DELHI, March 21``).
-    story_type : StoryType
-        Detected story category with matching section list.
+    Injects pre-extracted signals (quotes, key facts, human angle) into
+    the prompt sections that need them, rather than dumping raw text.
+
+    Args:
+        articles:           List of source article dicts.
+        topic:              Trend topic string.
+        signals:            Dict from extract_article_signals().
+        story_type_config:  Dict from detect_story_type_v2().
+        target_words:       Minimum word count target.
+        include_facts_snapshot: Whether to include key-facts snapshot section.
+
+    Returns:
+        Tuple of (system_message, user_prompt, dateline, story_type).
+
+    Example:
+        >>> sys_msg, prompt, dateline, story_type = build_synthesis_prompt_v2(
+        ...     articles, "Iran protests", signals, config, 800, True)
     """
-    story_type = detect_story_type(articles, topic)
     dateline = resolve_dateline(articles)
-    source_digest = extract_source_digest(articles)
-    quality_tiers = extract_newsworthiness_signals(articles)
+    story_type = story_type_config.get("name", "general")
+    source_digest = signals["source_digest"]
 
-    # Section structure for this story type
-    section_block = ""
-    if include_subheadings and story_type.sections:
-        section_list = "\n".join(f"## {s}" for s in story_type.sections)
-        section_block = (
-            f"\nRECOMMENDED SECTIONS for {story_type.name.upper()} stories:\n"
-            f"{section_list}\n"
-        )
+    # Story type sections — used in the narrative section prompt
+    story_sections = story_type_config.get("sections", [
+        "What Happened",
+        "The Stakes",
+        "Who Is Affected",
+        "Context and Analysis",
+        "Broader Implications",
+        "What Happens Next",
+    ])
 
-    subheading_count = int(os.getenv("SUBHEADING_COUNT", 5))
-    subheading_instruction = ""
-    if include_subheadings:
-        subheading_instruction = (
-            f"\n3. Include {subheading_count} descriptive subheadings "
-            f"(use ## markdown format)"
-        )
+    # Build section headings block for Phase 3
+    section_headings = "\n\n".join(
+        f"## {s}\n[paragraph]" for s in story_sections[:-1]
+    )
 
-    user_prompt = f"""Write a comprehensive news article about: {topic}
+    user_prompt = f"""You are about to write a news article about: {topic}
 
-STORY TYPE: {story_type.name.upper()}
+You have {len(articles)} source(s) to work from.
+Read every source carefully before doing anything else.
 
-═══════════════════════════════════════
-PART 1 – SOURCE MATERIALS
-═══════════════════════════════════════
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SOURCE MATERIAL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 {source_digest}
 
-═══════════════════════════════════════
-PART 2 – INFORMATION QUALITY FILTER
-═══════════════════════════════════════
-{quality_tiers}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 1 — AUDIT YOUR SOURCES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-═══════════════════════════════════════
-PART 3 – SCOPE CONSTRAINT
-═══════════════════════════════════════
-The MAIN TOPIC is: "{topic}"
-• Write EXCLUSIVELY about this topic.
-• If sources contain unrelated stories, IGNORE them completely.
-• Every paragraph must pass the test: "Is this about {topic}?" → YES.
-• DO NOT mix unrelated events (e.g., Gaza conflict + Australian Open).
+Before writing anything else, complete this audit.
+Write it inside <audit> tags exactly as shown.
+Be brutally honest about what is absent — this audit
+is what protects you from fabricating to fill gaps.
 
-═══════════════════════════════════════
-PART 4 – ATTRIBUTION RULES
-═══════════════════════════════════════
-BANNED – outlet attribution:
-  ❌ "According to BBC News…"
-  ❌ "Reuters reported…"
-  ❌ "Sources say…"
-ALLOWED – institutional attribution:
-  ✅ "The World Health Organization confirmed…"
-  ✅ "India's Finance Ministry stated…"
-  ✅ "Police said…"
+<audit>
+MOST NEWSWORTHY FACT:
+[The single most important thing that happened, in one sentence,
+drawn only from the sources above. If you cannot identify one
+clear fact, write "sources too thin to identify a lead fact".]
 
-═══════════════════════════════════════
-PART 5 – ARTICLE STRUCTURE
-═══════════════════════════════════════
-1. Headline (# markdown, 10-15 words) — about "{topic}" ONLY
-2. Subheading (### markdown, MAXIMUM 150 characters) — concise event summary{subheading_instruction}
-4. Dateline: {dateline} –
-5. Strong lead paragraph: who, what, when, where, why
-6. Organised body with subheadings (follow section guide below if applicable)
-7. Closing paragraph with implications or future outlook
-{section_block}
-═══════════════════════════════════════
-PART 6 – LENGTH & STYLE
-═══════════════════════════════════════
-• Minimum {target_words} words
-• AP Style, objective, factual tone
-• No opinions, no speculation, no fabricated facts
-• No Tier 4 information
+NAMED PEOPLE:
+[Every person named in the sources. For each, write their exact
+stated role if the source gives one. If the source gives no role,
+write "no role stated". Do not use your memory to add a title.]
 
-═══════════════════════════════════════
-PART 7 – OUTPUT FORMAT
-═══════════════════════════════════════
-# [Headline]
+DIRECT QUOTES:
+[Copy any text inside quotation marks from the sources, verbatim.
+If none exist, write "none".]
 
-### [Subheading – max 150 chars]
+KEY NUMBERS AND DATES:
+[Every figure, percentage, count, monetary amount, and date that
+appears explicitly in the sources. If none, write "none".]
 
-{dateline} –
+NAMED INSTITUTIONS:
+[Every organisation, government body, country, or official body
+named in the sources. If none, write "none".]
 
-[Lead paragraph]
+WHAT I DO NOT HAVE:
+[Facts a reader would reasonably expect that are absent from the
+sources. Be specific. Example: "No casualty figures", "No official
+government response", "No timeline of events". This section
+defines the limits of what you are permitted to write.]
+</audit>
 
-## [Section 1]
-[Content]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 2 — PLAN YOUR STORY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-## [Section 2]
-[Content]
+Using only what appeared in your audit, plan the article
+as a continuous story. Write it inside <plan> tags.
+One sentence per movement. This map governs everything
+you write in Phase 3.
 
-...
+<plan>
+OPENING HOOK:
+[The one fact or moment that pulls the reader in.
+This becomes the first sentence of your lead paragraph.]
 
-═══════════════════════════════════════
-PART 8 – SELF-CHECK BEFORE SUBMITTING
-═══════════════════════════════════════
-Before you finish, verify:
-☑ Every paragraph is about "{topic}"
-☑ No outlet names appear in the text
-☑ Dateline is present and correct
-☑ Word count ≥ {target_words}
-☑ Subheading ≤ 150 characters
+CENTRAL TENSION:
+[What makes this story not simple — the competing interest,
+the unanswered question, or the stakes. Every news story
+has one. Name it specifically using your audit material.]
 
-Write the article NOW:"""
+HUMAN DIMENSION:
+[Who bears the consequence of these events and how.
+If your audit's NAMED PEOPLE section is empty or your
+sources contain no human impact detail, write:
+"sources do not contain human impact — will note honestly."]
 
-    return SYSTEM_MESSAGE, user_prompt, dateline, story_type
+BROADER PICTURE:
+[Why this matters beyond the immediate story. Name one
+country or institution from your audit's NAMED INSTITUTIONS.
+If NAMED INSTITUTIONS is "none", write:
+"sources do not support broader implications section —
+will state this honestly rather than invent."]
+
+WHAT COMES NEXT:
+[One specific upcoming event, decision, or deadline
+confirmed in your sources. If your audit's KEY NUMBERS
+AND DATES contains no future events, write:
+"no confirmed next event in sources — will name the
+open question instead of inventing an event."]
+
+NARRATIVE ARC:
+[One sentence describing the shape of the whole story.
+Example: "This story moves from policy announcement to
+economic uncertainty to unresolved geopolitical tension."
+This sentence keeps your sections connected as you write.]
+</plan>
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 3 — WRITE THE ARTICLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+You have your audit. You have your plan. Now write.
+
+Every fact must trace to your audit.
+Every section must serve the narrative arc in your plan.
+The sections are movements in a single story — write them
+as such, not as isolated boxes to fill.
+
+FLOW RULE — apply to every section transition:
+The last sentence of each section must do one of two things:
+  (a) Answer a question and raise a new one the next section
+      will address — pulling the reader forward naturally.
+  (b) State a consequence or tension the next section will
+      explore — creating continuity, not a hard stop.
+Read your last sentence before moving to the next section.
+If it could be the last sentence of an unrelated article,
+rewrite it until it cannot.
+
+ANTI-HALLUCINATION RULE:
+You may only use what is in your audit under NAMED PEOPLE,
+DIRECT QUOTES, KEY NUMBERS AND DATES, and NAMED INSTITUTIONS.
+You may not use anything from WHAT I DO NOT HAVE.
+If a section cannot be filled honestly from your audit,
+write one sentence saying what is not yet known, then move on.
+
+ATTRIBUTION RULE:
+Attribute only to people and institutions in your audit.
+Write their exact stated role if your audit contains it.
+If your audit says "no role stated", write their name only.
+Never add a title your audit does not contain.
+If your audit's DIRECT QUOTES is "none", use reported
+speech only: "[Name] said that..." not "[Name] stated '...'".
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ARTICLE OUTPUT FORMAT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Write your article now, starting immediately below.
+The very first line must be the # headline.
+The very second line must be the ### subheadline.
+Nothing before the headline. Nothing between headline
+and subheadline.
+
+# [Headline — 10–15 words, active voice, names who did what, about {topic}]
+### [Subheadline — one sentence, max 150 characters, adds context not already in the headline]
+
+{dateline} —
+
+[Lead paragraph: expand your OPENING HOOK into 2–3 sentences.
+Answer who, what, where, when. Make the reader need the next paragraph.
+Do not summarise the whole article here — just earn the next sentence.]
+
+**Key facts:**
+- [fact drawn from audit]
+- [fact drawn from audit]
+- [fact drawn from audit]
+- [fact drawn from audit — if your audit contains fewer than 4
+  confirmed facts, write 3 and add: "Available source material
+  does not contain a fourth confirmed fact."]
+
+## {story_sections[0] if len(story_sections) > 0 else "What Happened"}
+[Expand OPENING HOOK and CENTRAL TENSION from your plan.
+End with a sentence that introduces the human dimension
+or raises the stakes — bridging naturally to the next section.]
+
+## {story_sections[1] if len(story_sections) > 1 else "The Stakes"}
+[Expand CENTRAL TENSION. Why does this matter?
+Who or what is at risk? Ground it in your audit material.
+End with a sentence that brings in the human or broader dimension.]
+
+## {story_sections[2] if len(story_sections) > 2 else "Who Is Affected"}
+[Expand HUMAN DIMENSION from your plan.
+If your plan says sources do not contain human impact, write:
+"The direct human consequences of [specific event from audit]
+are not yet clear from available reporting. What is confirmed
+is [one fact from audit]."
+End with a sentence that opens toward the broader picture.]
+
+## {story_sections[3] if len(story_sections) > 3 else "Context and Analysis"}
+[Historical background that illuminates the current situation.
+When you move from fact to interpretation, write "Analysis:" before
+that sentence so the reader knows. End with a sentence that raises
+the implications for the region or world.]
+
+## {story_sections[4] if len(story_sections) > 4 else "Broader Implications"}
+[Expand BROADER PICTURE from your plan.
+Name the country or institution from your audit.
+If your plan says sources do not support this section, write:
+"The available source material does not contain sufficient detail
+to assess broader implications at this stage."
+End with a sentence that points toward what comes next.]
+
+## What Happens Next
+[If your plan's WHAT COMES NEXT contains a confirmed event:
+name the institution, the decision, and the date if known.
+
+If your plan says "no confirmed next event", write:
+"The immediate next steps in [specific situation from audit]
+remain unconfirmed in available reporting. The central question —
+[state the CENTRAL TENSION from your plan verbatim] —
+will determine how this story develops."
+
+Do not invent an event. Do not write "the world watches"
+or "time will tell". Name the open question if you cannot
+name the event.]
+
+Minimum {target_words} words. AP Style throughout.
+This is journalism, not a form. Write it as a story.
+"""
+
+    return SYSTEM_MESSAGE_V3, user_prompt, dateline, story_type
 
 
-# ───────────────────────────────────────
-# Article parser
-# ───────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# POST-GENERATION VALIDATOR — V2
+# ═══════════════════════════════════════════════════════════════════
+
+def validate_article_v2(article: Dict, topic: str, signals: Dict,
+                        story_type_config: dict = None) -> Dict:
+    """
+    Hard post-generation validator for 10-section articles.
+
+    Checks required sections, quote presence, word count, topic drift,
+    and outlet-name leaks. Returns a result dict that the caller uses
+    to decide whether to retry or proceed.
+
+    Args:
+        article: Parsed article dict with 'heading', 'sub_heading', 'story'.
+        topic:   Trend topic string.
+        signals: Dict from extract_article_signals() (used for context).
+        story_type_config: Optional story type config dict from detect_story_type_v2().
+
+    Returns:
+        dict with keys:
+            passes   – bool (True only if failures list is empty)
+            failures – list of failure-reason strings (block upload)
+            warnings – list of warning strings (logged but do not block)
+
+    Example:
+        >>> result = validate_article_v2(article, "Iran protests", signals)
+        >>> if not result["passes"]:
+        ...     print(result["failures"])
+    """
+    story = article.get("story", "")
+    heading = article.get("heading", "")
+    failures: List[str] = []
+    warnings: List[str] = []
+
+    # --- Fix 1 — structural format checks ---
+    heading_words = heading.strip().split()
+    if len(heading_words) < 4:
+        failures.append(
+            "Section 1 — headline missing or malformed: model did not produce a "
+            "# headline line (got: '{}')".format(heading.strip()[:80])
+        )
+
+    sub_heading = article.get("sub_heading", "")
+    if not sub_heading.strip():
+        failures.append(
+            "Section 2 — subheadline missing: model did not produce a "
+            "### subheadline line"
+        )
+    # --- END Fix 1 ---
+
+    # ── Section 4: Key facts snapshot ──
+    if not re.search(r'\*\*Key facts\*\*|key facts:', story, re.IGNORECASE):
+        failures.append("Missing required section: Key Facts snapshot")
+
+    # ── Dynamic section validation ──
+    # Check for sections that the prompt actually told the model to write,
+    # not a hardcoded list from the previous prompt architecture.
+    # story_type_config["sections"] contains the sections used to build
+    # the prompt for this specific article generation attempt.
+    story_type_sections = (
+        story_type_config.get("sections", [])
+        if story_type_config
+        else []
+    )
+
+    # These two sections are always required regardless of story type
+    # because the three-phase prompt always includes them
+    always_required = ["What Happens Next"]
+
+    all_required = story_type_sections + [
+        s for s in always_required if s not in story_type_sections
+    ]
+
+    for section in all_required:
+        if f"## {section}" not in story:
+            failures.append(f"Missing required section: {section}")
+
+    # ── Quote presence check ──
+    # Check for (a) actual quote characters with 15+ char content, or
+    # (b) attribution phrases indicating reported speech
+    has_quotes = bool(
+        re.search(r'[\u201c\u201d"""][^"\u201c\u201d\u201e]{15,}[\u201c\u201d"""]', story)
+    )
+    has_attribution = bool(
+        re.search(
+            r'\b(?:stated|confirmed|told reporters|said in a statement)\b',
+            story,
+            re.IGNORECASE,
+        )
+    )
+    if not has_quotes and not has_attribution:
+        failures.append(
+            "No quotes or attributed statements found — article needs ≥2 "
+            "named quotes or attribution phrases"
+        )
+
+    # ── Word count check ──
+    word_count = len(story.split())
+    if word_count < 700:
+        failures.append(f"Word count too low: {word_count} (minimum 700)")
+
+    # ── Topic drift check (warning, not failure) ──
+    # Extract 4+ char keywords from topic for checking
+    topic_keywords = [w.lower() for w in topic.split() if len(w) >= 4]
+    if topic_keywords:
+        paragraphs = story.split("\n\n")
+        off_topic_count = 0
+        for para in paragraphs:
+            para_stripped = para.strip()
+            # Skip section headers and short paragraphs
+            if para_stripped.startswith("##") or len(para_stripped) < 50:
+                continue
+            para_lower = para_stripped.lower()
+            if not any(kw in para_lower for kw in topic_keywords):
+                off_topic_count += 1
+        if off_topic_count > 2:
+            warnings.append(
+                f"Possible topic drift: {off_topic_count} paragraphs have "
+                f"no overlap with topic keywords ({', '.join(topic_keywords[:5])})"
+            )
+
+    # ── Outlet name leak check (warning, not failure) ──
+    outlet_matches = _OUTLET_LEAK_RE.findall(story)
+    if outlet_matches:
+        unique_outlets = list(set(outlet_matches))
+        warnings.append(
+            f"Outlet names found in body text: {', '.join(unique_outlets)}"
+        )
+
+    # --- Fix 3 — Section 5 heading match check ---
+    if story_type_config and story_type_config.get("sections"):
+        # Extract all ## headers from the body
+        all_headers = re.findall(r'^## (.+)$', story, re.MULTILINE)
+
+        # Fixed-section keywords to exclude (sections 7-10 headers)
+        fixed_keywords = {
+            "context", "analysis", "broader", "implications", "regional",
+            "numbers", "data", "timeline", "what", "looking"
+        }
+
+        # Filter to Section 5 narrative headers only
+        narrative_headers = [
+            h for h in all_headers
+            if not any(kw in h.lower() for kw in fixed_keywords)
+        ]
+
+        if not narrative_headers:
+            warnings.append(
+                "Section 5 — no ## section headings found in narrative body"
+            )
+        else:
+            # Build vocabulary from expected section headings
+            expected_vocab = set()
+            for section_heading in story_type_config["sections"]:
+                for word in section_heading.lower().split():
+                    if len(word) >= 4:
+                        expected_vocab.add(word)
+
+            # Score each narrative header against expected vocabulary
+            matched = [
+                h for h in narrative_headers
+                if any(w in expected_vocab
+                       for w in h.lower().split() if len(w) >= 4)
+            ]
+
+            if len(matched) == 0:
+                warnings.append(
+                    "Section 5 — narrative headings do not match detected story "
+                    "type '{}': found {}, expected vocabulary from {}".format(
+                        story_type_config.get("name", "unknown"),
+                        narrative_headers,
+                        story_type_config["sections"]
+                    )
+                )
+    # --- END Fix 3 ---
+
+    return {
+        "passes": len(failures) == 0,
+        "failures": failures,
+        "warnings": warnings,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ARTICLE PARSER (unchanged from V1)
+# ═══════════════════════════════════════════════════════════════════
 
 def parse_generated_article(generated_text: str) -> Dict:
     """
     Parse LLM-generated text into a structured article dict.
-
-    Returns
-    -------
-    dict with keys ``heading``, ``sub_heading``, ``story``.
+    Strips <audit> and <plan> blocks produced by the three-phase
+    prompt before extracting heading / sub_heading / story.
     """
     if not generated_text:
         return {"heading": "", "sub_heading": "", "story": ""}
 
+    # ── Strip Phase 1 and Phase 2 thinking blocks ──
+    # The three-phase prompt produces <audit>...</audit> and
+    # <plan>...</plan> before the article. Remove them so they
+    # do not appear in the stored article or CMS upload.
+    import re as _re
+    generated_text = _re.sub(
+        r"<audit>.*?</audit>",
+        "",
+        generated_text,
+        flags=_re.DOTALL,
+    ).strip()
+    generated_text = _re.sub(
+        r"<plan>.*?</plan>",
+        "",
+        generated_text,
+        flags=_re.DOTALL,
+    ).strip()
+
+    # ── Existing parsing logic continues below unchanged ──
     lines = generated_text.strip().split("\n")
 
     # ── Extract headline (first line starting with # or ##) ──

@@ -140,6 +140,13 @@ class MongoDBClient:
             self.articles.create_index([("source_url", ASCENDING)], unique=True, sparse=True)
             # Retry queue index
             self.articles.create_index([("upload_status", ASCENDING), ("upload_last_retry", ASCENDING)])
+            # Prompt debug index — sparse so older articles without prompt_debug
+            # are not included, avoiding null-key index bloat
+            self.articles.create_index(
+                [("prompt_debug.captured_at", DESCENDING)],
+                sparse=True,
+                name="prompt_debug_captured_at"
+            )
             
             # Trends indexes — topic is unique (match existing DB index)
             self.trends.create_index([("topic", ASCENDING)], unique=True)
