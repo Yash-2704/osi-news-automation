@@ -149,6 +149,7 @@ def run_pipeline(dry_run: bool = False) -> dict:
         if not db.connect():
             raise Exception("Failed to connect to MongoDB")
         logger.info("✅ Database connected")
+        run_number = db.sessions.count_documents({})
         
         # Initialize image generation (if enabled)
         if os.getenv('ENABLE_IMAGE_GENERATION', 'false').lower() == 'true' and not dry_run:
@@ -165,7 +166,7 @@ def run_pipeline(dry_run: bool = False) -> dict:
         max_articles = int(os.getenv('MAX_ARTICLES_PER_RUN', 50))
         logger.info(f"Target: {max_articles} articles")
         
-        articles = scrape_news_batch(max_articles=max_articles)
+        articles = scrape_news_batch(max_articles=max_articles, run_number=run_number)
         
         if not articles:
             logger.error("❌ No articles scraped. Aborting pipeline.")
@@ -191,7 +192,10 @@ def run_pipeline(dry_run: bool = False) -> dict:
         
         top_n_trends = int(os.getenv('TOP_TRENDS_COUNT', 5))
         min_cluster_size = int(os.getenv('MIN_CLUSTER_SIZE', 1))
-        similarity_threshold = float(os.getenv('DUPLICATE_SIMILARITY_THRESHOLD', 0.6))
+        # Read a dedicated clustering threshold — reusing the duplicate
+        # detection threshold (0.8) produces distance_threshold=0.20
+        # which is too tight and collapses unrelated topics into singletons.
+        similarity_threshold = float(os.getenv('CLUSTER_SIMILARITY_THRESHOLD', 0.50))
 
         # Use the actual NLP clustering from trend_analyzer to group similar stories into single trends
         trends = detect_trends(
@@ -237,6 +241,39 @@ def run_pipeline(dry_run: bool = False) -> dict:
                 )
                 stats['errors'].append(
                     f"Skipped (single source): {trend['topic']}"
+                )
+                continue
+
+            # Guard: skip clusters whose total source words are too few to
+            # reach the 700-word minimum without fabrication.
+            total_source_words = sum(
+                len(a.get('story', '').split())
+                for a in trend.get('articles', [])
+            )
+            if total_source_words < 400:
+                logger.warning(
+                    f"⏭️  Skipping '{trend['topic']}' — "
+                    f"insufficient source material "
+                    f"({total_source_words} words total). "
+                    f"Minimum 400 required."
+                )
+                stats['errors'].append(
+                    f"Skipped (thin sources): {trend['topic']}"
+                )
+                continue
+
+            # Guard: skip clusters with low internal similarity — sources
+            # are likely unrelated and will produce contaminated output.
+            avg_sim = trend.get('avg_similarity', 0.0)
+            COHERENCE_FLOOR = 0.55
+            if avg_sim < COHERENCE_FLOOR:
+                logger.warning(
+                    f"⏭️  Skipping '{trend['topic']}' — "
+                    f"low cluster coherence ({avg_sim:.2f}). "
+                    f"Sources likely unrelated."
+                )
+                stats['errors'].append(
+                    f"Skipped (incoherent cluster): {trend['topic']}"
                 )
                 continue
             

@@ -476,11 +476,11 @@ def detect_story_type_v2(
         scores["conflict"] = scores.get("conflict", 0) + 2
     # --- END Fix 2 ---
 
-    # Find the winning type with minimum threshold of 2
+    # Find the winning type with minimum threshold of 3
     best_type = max(scores, key=scores.get) if scores else "general"
     best_score = scores.get(best_type, 0)
 
-    if best_score < 2:
+    if best_score < 3:
         best_type = "general"
 
     result = STORY_TYPES_V2[best_type]
@@ -592,6 +592,25 @@ def build_synthesis_prompt_v2(
         f"## {s}\n[paragraph]" for s in story_sections[:-1]
     )
 
+    # Only add the hardcoded "Looking Ahead" closing section when it
+    # is NOT already one of the story-type sections (e.g. the
+    # "general" type already has "Looking Ahead" as sections[4]).
+    if "Looking Ahead" not in story_sections:
+        looking_ahead_block = """
+# Removing the canned fallback sentence forces the model to write
+# what it knows rather than copy a hedge phrase into the article.
+## Looking Ahead
+[Expand WHAT COMES NEXT from your plan using only confirmed
+audit material. Name the upcoming decision, deadline, or open
+question. Write what IS known — who is watching, what the
+outcome depends on. If sources are thin, write two sentences
+on the confirmed open question and stop.
+Do NOT write any sentence explaining that source material is
+insufficient or that implications cannot be assessed.
+Never write meta-commentary about what you do not have.]"""
+    else:
+        looking_ahead_block = ""
+
     user_prompt = f"""You are about to write a news article about: {topic}
 
 You have {len(articles)} source(s) to work from.
@@ -674,12 +693,16 @@ If NAMED INSTITUTIONS is "none", write:
 "sources do not support broader implications section —
 will state this honestly rather than invent."]
 
+# Removing the literal hedge phrase stops it propagating into
+# the article body through the plan. Redirect to a real question.
 WHAT COMES NEXT:
-[One specific upcoming event, decision, or deadline
-confirmed in your sources. If your audit's KEY NUMBERS
-AND DATES contains no future events, write:
-"no confirmed next event in sources — will name the
-open question instead of inventing an event."]
+[One specific upcoming event, decision, or deadline confirmed
+in your sources. If no future event is confirmed, name the
+single open question the story leaves unresolved — write it
+as a direct question, not a hedge sentence.
+Example: "Will Liverpool replace Salah before the window?"
+Do NOT write the phrase "no confirmed next event in sources"
+— that is a planning note, not plan content.]
 
 NARRATIVE ARC:
 [One sentence describing the shape of the whole story.
@@ -743,13 +766,16 @@ and subheadline.
 Answer who, what, where, when. Make the reader need the next paragraph.
 Do not summarise the whole article here — just earn the next sentence.]
 
+# Removing the explicit fallback instruction prevents the model
+# from copying a meta-commentary sentence into the published list.
 **Key facts:**
 - [fact drawn from audit]
 - [fact drawn from audit]
 - [fact drawn from audit]
-- [fact drawn from audit — if your audit contains fewer than 4
-  confirmed facts, write 3 and add: "Available source material
-  does not contain a fourth confirmed fact."]
+- [fact drawn from audit — write only as many bullets as you have
+  confirmed facts. If you have fewer than 4 stop at 3 or 2.
+  Do NOT write a bullet explaining that facts are unavailable.
+  Silence is better than scaffolding.]
 
 ## {story_sections[0] if len(story_sections) > 0 else "What Happened"}
 [Expand OPENING HOOK and CENTRAL TENSION from your plan.
@@ -776,26 +802,12 @@ that sentence so the reader knows. End with a sentence that raises
 the implications for the region or world.]
 
 ## {story_sections[4] if len(story_sections) > 4 else "Broader Implications"}
-[Expand BROADER PICTURE from your plan.
-Name the country or institution from your audit.
-If your plan says sources do not support this section, write:
-"The available source material does not contain sufficient detail
-to assess broader implications at this stage."
-End with a sentence that points toward what comes next.]
+[Connect the immediate events to their wider significance —
+regional stability, institutional credibility, or precedent-setting
+consequences. Ground every claim in your audit material.
+End with a sentence that sets up the closing forward-looking section.]
 
-## What Happens Next
-[If your plan's WHAT COMES NEXT contains a confirmed event:
-name the institution, the decision, and the date if known.
-
-If your plan says "no confirmed next event", write:
-"The immediate next steps in [specific situation from audit]
-remain unconfirmed in available reporting. The central question —
-[state the CENTRAL TENSION from your plan verbatim] —
-will determine how this story develops."
-
-Do not invent an event. Do not write "the world watches"
-or "time will tell". Name the open question if you cannot
-name the event.]
+{looking_ahead_block}
 
 Minimum {target_words} words. AP Style throughout.
 This is journalism, not a form. Write it as a story.
@@ -872,7 +884,9 @@ def validate_article_v2(article: Dict, topic: str, signals: Dict,
 
     # These two sections are always required regardless of story type
     # because the three-phase prompt always includes them
-    always_required = ["What Happens Next"]
+    # "What Happens Next" removed from prompt — "Looking Ahead" is
+    # now the sole canonical forward-looking section to validate.
+    always_required = ["Looking Ahead"]
 
     all_required = story_type_sections + [
         s for s in always_required if s not in story_type_sections

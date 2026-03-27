@@ -75,8 +75,13 @@ class MongoDBClient:
                 logger.info("Loading sentence transformer model...")
                 self._embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
                 logger.info("Sentence transformer model loaded successfully")
-            except ImportError:
-                logger.warning("sentence-transformers not installed, embedding-based dedup disabled")
+            # Log the actual ImportError message so the real cause is
+            # visible in logs rather than the misleading "not installed".
+            except ImportError as e:
+                logger.warning(
+                    f"sentence-transformers unavailable ({e}), "
+                    f"embedding-based dedup disabled"
+                )
         return self._embedding_model
     
     def connect(self) -> bool:

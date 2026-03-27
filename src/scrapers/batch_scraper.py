@@ -16,6 +16,7 @@ import os
 import sys
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
+from collections import defaultdict
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
@@ -255,29 +256,55 @@ def extract_article_urls(source: Dict, prefer_rss: bool = True) -> List[str]:
 # BATCH SCRAPING
 # ===========================================
 
-def load_news_sources(config_path: str = 'config/news_sources.yaml') -> List[Dict]:
+def load_news_sources(
+    config_path: str = 'config/news_sources.yaml',
+    run_number: int = None
+) -> List[Dict]:
     """
-    Load enabled news sources from configuration file.
-    
+    Load enabled news sources, applying tier-based scheduling.
+
+    Tier logic:
+      - Priority 1-2 (core sources): included every run
+      - Priority 3   (regional):     included every other run (even run numbers)
+      - Priority 4+  (specialist):   included every 3rd run
+
     Args:
         config_path: Path to news_sources.yaml.
-        
+        run_number:  Monotonic run counter from DB or env. If None, all sources load
+                     (safe default for dry-runs and tests).
+
     Returns:
-        List of enabled source configurations, sorted by priority.
+        List of enabled, scheduled source configurations sorted by priority.
     """
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
-        
-        # Filter enabled sources
-        sources = [s for s in config.get('sources', []) if s.get('enabled', True)]
-        
-        # Sort by priority (1 = highest)
-        sources.sort(key=lambda x: x.get('priority', 5))
-        
-        logger.info(f"Loaded {len(sources)} enabled news sources")
-        return sources
-        
+
+        all_sources = [s for s in config.get('sources', []) if s.get('enabled', True)]
+
+        if run_number is None:
+            selected = all_sources
+        else:
+            selected = []
+            for source in all_sources:
+                priority = source.get('priority', 5)
+                if priority <= 2:
+                    selected.append(source)
+                elif priority == 3:
+                    if run_number % 2 == 0:
+                        selected.append(source)
+                else:
+                    if run_number % 3 == 0:
+                        selected.append(source)
+
+        selected.sort(key=lambda x: x.get('priority', 5))
+
+        logger.info(
+            f"Loaded {len(selected)}/{len(all_sources)} sources "
+            f"(run_number={run_number}, scheduling {'active' if run_number is not None else 'disabled'})"
+        )
+        return selected
+
     except FileNotFoundError:
         logger.error(f"Config file not found: {config_path}")
         return []
@@ -292,7 +319,8 @@ def scrape_news_batch(
     prefer_rss: bool = True,
     min_per_source: int = 2,
     max_per_source: int = 10,
-    session_id: str = None
+    session_id: str = None,
+    run_number: int = None
 ) -> List[Dict]:
     """
     Scrape articles from multiple news sources.
@@ -320,7 +348,7 @@ def scrape_news_batch(
     
     # Load sources if not provided
     if sources is None:
-        sources = load_news_sources()
+        sources = load_news_sources(run_number=run_number)
     
     if not sources:
         logger.error("No news sources configured")
@@ -332,6 +360,8 @@ def scrape_news_batch(
     start_time = time.time()
     sources_scraped = 0
     
+    source_stats = defaultdict(lambda: {"attempted": 0, "succeeded": 0, "failed": 0})
+
     for source in sources:
         if len(articles) >= max_articles:
             logger.info(f"Reached target of {max_articles} articles")
@@ -364,29 +394,40 @@ def scrape_news_batch(
                 time.sleep(delay)
                 
                 # Scrape article
+                source_stats[source_name]["attempted"] += 1
                 article_data = scrape_single_article(url, source_name)
                 
                 if article_data:
-                    # Add metadata
                     article_data['source_region'] = source.get('region', 'Unknown')
                     article_data['session_id'] = session_id
                     article_data['priority'] = source.get('priority', 5)
-                    
                     articles.append(article_data)
                     source_articles += 1
-                    
+                    source_stats[source_name]["succeeded"] += 1
                     logger.info(f"   ✅ [{len(articles)}/{max_articles}] {article_data['heading'][:50]}...")
                 else:
                     failed_urls.append(url)
+                    source_stats[source_name]["failed"] += 1
                 
-                # Check if we have minimum from this source
-                if source_articles >= min_per_source and len(articles) >= max_articles * 0.5:
-                    # Move to next source after getting minimum
+                # Dynamic per-source cap: spread budget proportionally across remaining sources
+                remaining_sources = max(1, len(sources) - sources.index(source))
+                remaining_budget = max_articles - len(articles)
+                dynamic_cap = max(min_per_source, remaining_budget // remaining_sources)
+
+                if source_articles >= dynamic_cap:
                     break
             
             if source_articles > 0:
                 sources_scraped += 1
                 logger.info(f"   Scraped {source_articles} articles from {source_name}")
+            else:
+                attempted = source_stats[source_name]["attempted"]
+                if attempted > 0:
+                    logger.warning(
+                        f"   ⚠️  ZERO yield from {source_name} "
+                        f"({attempted} URLs attempted, 0 succeeded). "
+                        f"Check RSS feed or geoblocking."
+                    )
             
         except Exception as e:
             logger.error(f"Error processing {source_name}: {e}")
@@ -406,6 +447,22 @@ def scrape_news_batch(
     logger.info(f"   Session ID: {session_id}")
     logger.info("="*60 + "\n")
     
+    dead_sources = [
+        name for name, s in source_stats.items()
+        if s["attempted"] > 0 and s["succeeded"] == 0
+    ]
+    low_yield_sources = [
+        name for name, s in source_stats.items()
+        if s["attempted"] > 0 and 0 < s["succeeded"] < 2
+    ]
+
+    if dead_sources:
+        logger.warning(f"   🚨 Dead sources  : {', '.join(dead_sources)}")
+    if low_yield_sources:
+        logger.warning(f"   ⚠️  Low yield     : {', '.join(low_yield_sources)}")
+
+    _persist_source_health(session_id, source_stats)
+
     return articles
 
 
@@ -442,6 +499,97 @@ def scrape_specific_sources(
         sources=selected_sources,
         prefer_rss=prefer_rss
     )
+
+
+def scrape_by_tier(
+    tiers: List[int],
+    max_articles: int = 50,
+    prefer_rss: bool = True,
+    session_id: str = None,
+) -> List[Dict]:
+    """
+    Scrape only sources matching the given priority tiers.
+
+    Example:
+        # Fast run — tier 1 wire services only
+        articles = scrape_by_tier([1], max_articles=20)
+
+        # Full run — all tiers
+        articles = scrape_by_tier([1, 2, 3, 4], max_articles=50)
+
+    Args:
+        tiers:        List of priority numbers to include.
+        max_articles: Article cap.
+        prefer_rss:   Prefer RSS over page scraping.
+        session_id:   Optional session ID.
+
+    Returns:
+        List of scraped article dictionaries.
+    """
+    all_sources = load_news_sources()   # no run_number = load all enabled
+    selected = [s for s in all_sources if s.get('priority', 5) in tiers]
+
+    if not selected:
+        logger.warning(f"No sources found for tiers: {tiers}")
+        return []
+
+    logger.info(f"Tier-filtered scrape: tiers={tiers}, sources={len(selected)}")
+    return scrape_news_batch(
+        max_articles=max_articles,
+        sources=selected,
+        prefer_rss=prefer_rss,
+        session_id=session_id,
+    )
+
+
+def _persist_source_health(session_id: str, source_stats: dict) -> None:
+    """
+    Write per-source yield data to MongoDB for dashboard visibility.
+    Failures accumulate as a counter — the dashboard flags sources that
+    have been dead for N consecutive runs.
+    """
+    try:
+        from src.database.mongo_client import get_client
+        db = get_client()
+        if not db._ensure_connected():
+            return
+
+        now = datetime.utcnow()
+        for source_name, stats in source_stats.items():
+            yield_rate = (
+                stats["succeeded"] / stats["attempted"]
+                if stats["attempted"] > 0 else None
+            )
+            db.db["source_health"].update_one(
+                {"source_name": source_name},
+                {
+                    "$set": {
+                        "last_seen": now,
+                        "last_yield_rate": yield_rate,
+                        "last_session_id": session_id,
+                    },
+                    "$push": {
+                        "recent_yields": {
+                            "$each": [{"ts": now, "rate": yield_rate}],
+                            "$slice": -20,
+                        }
+                    },
+                    "$inc": {
+                        "consecutive_failures": 0 if (yield_rate or 0) > 0 else 1,
+                        "total_runs": 1,
+                    },
+                    "$setOnInsert": {"created_at": now},
+                },
+                upsert=True,
+            )
+            if (yield_rate or 0) > 0:
+                db.db["source_health"].update_one(
+                    {"source_name": source_name},
+                    {"$set": {"consecutive_failures": 0}}
+                )
+
+    except Exception as e:
+        logger.warning(f"Could not persist source health: {e}")
 
 
 # ===========================================

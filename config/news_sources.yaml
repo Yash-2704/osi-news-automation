@@ -93,6 +93,122 @@ sources:
     enabled: false  # Paywall blocks all content — March 2026
     rate_limit_delay: 4
 
+  # Business & Finance (Tier 1)
+
+  - name: "Financial Times"
+    url: "https://www.ft.com"
+    rss_feed: "https://www.ft.com/rss/home"
+    backup_url: "https://www.ft.com/world"
+    region: "UK"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 1
+    enabled: false
+    rate_limit_delay: 4
+
+  - name: "Bloomberg"
+    url: "https://www.bloomberg.com"
+    rss_feed: "https://feeds.bloomberg.com/markets/news.rss"
+    backup_url: "https://www.bloomberg.com/markets"
+    region: "US"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 1
+    enabled: false
+    rate_limit_delay: 4
+
+  - name: "The Wall Street Journal"
+    url: "https://www.wsj.com"
+    rss_feed: "https://feeds.a.dj.com/rss/RSSWorldNews.xml"
+    backup_url: "https://www.wsj.com/news/world"
+    region: "US"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 1
+    enabled: false
+    rate_limit_delay: 4
+
+  - name: "AFP"
+    url: "https://www.afp.com/en"
+    rss_feed: "https://www.afp.com/en/agencies/afp-agency"
+    backup_url: "https://www.afp.com/en/news-hub"
+    region: "International"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 1
+    enabled: false  # Requires syndication arrangement — enable once RSS endpoint confirmed
+    rate_limit_delay: 3
+
+  # Asia-Pacific & North American Broadcasters (Tier 1)
+
+  - name: "ABC News Australia"
+    url: "https://www.abc.net.au/news"
+    rss_feed: "https://www.abc.net.au/news/feed/51120/rss.xml"
+    backup_url: "https://www.abc.net.au/news/justin"
+    region: "Australia"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 1
+    enabled: true
+    rate_limit_delay: 3
+
+  - name: "Channel NewsAsia"
+    url: "https://www.channelnewsasia.com"
+    rss_feed: "https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml"
+    backup_url: "https://www.channelnewsasia.com/news"
+    region: "Asia"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 1
+    enabled: true
+    rate_limit_delay: 3
+
+  - name: "CBC News"
+    url: "https://www.cbc.ca/news"
+    rss_feed: "https://www.cbc.ca/cmlink/rss-topstories"
+    backup_url: "https://www.cbc.ca/news/world"
+    region: "Canada"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 1
+    enabled: true
+    rate_limit_delay: 3
+
   # ===========================================
   # TIER 2: Major Regional News (Priority 2)
   # ===========================================
@@ -224,6 +340,522 @@ sources:
     priority: 2
     enabled: true
     rate_limit_delay: 3
+
+  # Africa (Tier 2)
+
+  - name: "AllAfrica"
+    url: "https://allafrica.com"
+    rss_feed: "https://allafrica.com/tools/headlines/rdf/latest/headlines.rdf"
+    backup_url: "https://allafrica.com/latest"
+    region: "Africa"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 3
+
+  - name: "Daily Nation"
+    url: "https://nation.africa"
+    rss_feed: "https://nation.africa/kenya/news/rss"
+    backup_url: "https://nation.africa/kenya/news"
+    region: "East Africa"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Daily Maverick"
+    url: "https://www.dailymaverick.co.za"
+    rss_feed: "https://www.dailymaverick.co.za/feed/"
+    backup_url: "https://www.dailymaverick.co.za/section/south-africa"
+    region: "South Africa"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Premium Times"
+    url: "https://www.premiumtimesng.com"
+    rss_feed: "https://www.premiumtimesng.com/feed"
+    backup_url: "https://www.premiumtimesng.com/news"
+    region: "West Africa"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: false
+    rate_limit_delay: 2
+
+  # Latin America (Tier 2)
+
+  - name: "Buenos Aires Herald"
+    url: "https://buenosairesherald.com"
+    rss_feed: "https://buenosairesherald.com/feed"
+    backup_url: "https://buenosairesherald.com/news"
+    region: "Argentina"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Merco Press"
+    url: "https://en.mercopress.com"
+    rss_feed: "https://en.mercopress.com/rss"
+    backup_url: "https://en.mercopress.com/latam"
+    region: "Latin America"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Tico Times"
+    url: "https://ticotimes.net"
+    rss_feed: "https://ticotimes.net/feed"
+    backup_url: "https://ticotimes.net/news"
+    region: "Central America"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  # Eastern Europe (Tier 2)
+
+  - name: "Kyiv Independent"
+    url: "https://kyivindependent.com"
+    rss_feed: "https://kyivindependent.com/feed/"
+    backup_url: "https://kyivindependent.com/news"
+    region: "Eastern Europe"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Radio Free Europe"
+    url: "https://www.rferl.org"
+    rss_feed: "https://www.rferl.org/api/zk-pqwt-iezry"
+    backup_url: "https://www.rferl.org/news"
+    region: "Eastern Europe"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Euractiv"
+    url: "https://www.euractiv.com"
+    rss_feed: "https://www.euractiv.com/feed/"
+    backup_url: "https://www.euractiv.com/section/politics"
+    region: "Europe"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  # Western Europe — RT replacement coverage (Tier 2)
+
+  - name: "Euronews"
+    url: "https://www.euronews.com"
+    rss_feed: "https://www.euronews.com/rss"
+    backup_url: "https://www.euronews.com/news/international"
+    region: "Europe"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Sky News"
+    url: "https://news.sky.com"
+    rss_feed: "https://feeds.skynews.com/feeds/rss/world.xml"
+    backup_url: "https://news.sky.com/world"
+    region: "UK"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  # East Africa (Tier 2)
+
+  - name: "Daily Nation"
+    url: "https://nation.africa"
+    rss_feed: "https://nation.africa/kenya/rss"
+    backup_url: "https://nation.africa/kenya/news"
+    region: "East Africa"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "The Citizen Tanzania"
+    url: "https://www.thecitizen.co.tz"
+    rss_feed: "https://www.thecitizen.co.tz/tanzania/rss"
+    backup_url: "https://www.thecitizen.co.tz/tanzania/news"
+    region: "East Africa"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Kigali Today"
+    url: "https://kigali.today"
+    rss_feed: "https://kigali.today/feed"
+    backup_url: "https://kigali.today/news"
+    region: "East Africa"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Daily Monitor"
+    url: "https://www.monitor.co.ug"
+    rss_feed: "https://www.monitor.co.ug/uganda/rss"
+    backup_url: "https://www.monitor.co.ug/uganda/news"
+    region: "East Africa"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  # Southern Africa (Tier 2)
+
+  - name: "Daily Maverick"
+    url: "https://www.dailymaverick.co.za"
+    rss_feed: "https://www.dailymaverick.co.za/feed/"
+    backup_url: "https://www.dailymaverick.co.za/section/south-africa"
+    region: "Southern Africa"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "SABC News"
+    url: "https://www.sabcnews.com"
+    rss_feed: "https://www.sabcnews.com/sabcnews/feed/"
+    backup_url: "https://www.sabcnews.com/category/south-africa"
+    region: "Southern Africa"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 3
+
+  - name: "The Namibian"
+    url: "https://www.namibian.com.na"
+    rss_feed: "https://www.namibian.com.na/rss"
+    backup_url: "https://www.namibian.com.na/news"
+    region: "Southern Africa"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "The Mast"
+    url: "https://www.themastonline.com"
+    rss_feed: "https://www.themastonline.com/feed"
+    backup_url: "https://www.themastonline.com/news"
+    region: "Southern Africa"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  # West Africa (Tier 2)
+
+  - name: "Premium Times"
+    url: "https://www.premiumtimesng.com"
+    rss_feed: "https://www.premiumtimesng.com/feed"
+    backup_url: "https://www.premiumtimesng.com/news"
+    region: "West Africa"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: false
+    rate_limit_delay: 2
+
+  - name: "Channels Television"
+    url: "https://www.channelstv.com"
+    rss_feed: "https://www.channelstv.com/feed"
+    backup_url: "https://www.channelstv.com/home/breaking-news"
+    region: "West Africa"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  # South Asia (Tier 2)
+
+  - name: "Indian Express"
+    url: "https://indianexpress.com"
+    rss_feed: "https://indianexpress.com/feed/"
+    backup_url: "https://indianexpress.com/section/india"
+    region: "South Asia"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "The Wire"
+    url: "https://thewire.in"
+    rss_feed: "https://thewire.in/feed"
+    backup_url: "https://thewire.in/category/politics"
+    region: "South Asia"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "The Daily Star"
+    url: "https://www.thedailystar.net"
+    rss_feed: "https://www.thedailystar.net/arcio/rss/"
+    backup_url: "https://www.thedailystar.net/news/bangladesh"
+    region: "South Asia"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  # Australia & New Zealand (Tier 2)
+
+  - name: "Sydney Morning Herald"
+    url: "https://www.smh.com.au"
+    rss_feed: "https://www.smh.com.au/rss/feed.xml"
+    backup_url: "https://www.smh.com.au/national"
+    region: "Australia"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Guardian Australia"
+    url: "https://www.theguardian.com/australia-news"
+    rss_feed: "https://www.theguardian.com/australia-news/rss"
+    backup_url: "https://www.theguardian.com/world/australia"
+    region: "Australia"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "New Zealand Herald"
+    url: "https://www.nzherald.co.nz"
+    rss_feed: "https://www.nzherald.co.nz/arc/outboundfeeds/rss/section/news/"
+    backup_url: "https://www.nzherald.co.nz/world"
+    region: "Oceania"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  # Canada & Caribbean (Tier 2)
+
+  - name: "Toronto Star"
+    url: "https://www.thestar.com"
+    rss_feed: "https://www.thestar.com/content/thestar/feed.RSSManagerServlet.articles.topstories.rss"
+    backup_url: "https://www.thestar.com/news/world"
+    region: "Canada"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "The Globe and Mail"
+    url: "https://www.theglobeandmail.com"
+    rss_feed: "https://www.theglobeandmail.com/arc/outboundfeeds/rss/category/canada/"
+    backup_url: "https://www.theglobeandmail.com/canada"
+    region: "Canada"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Jamaica Gleaner"
+    url: "https://jamaica-gleaner.com"
+    rss_feed: "https://jamaica-gleaner.com/feed"
+    backup_url: "https://jamaica-gleaner.com/news"
+    region: "Caribbean"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 2
+    enabled: true
+    rate_limit_delay: 2
 
   # ===========================================
   # TIER 3: European News (Priority 3)
@@ -360,6 +992,558 @@ sources:
     priority: 3
     enabled: true
     rate_limit_delay: 3
+
+  # Southeast Asia (Tier 3)
+
+  - name: "Jakarta Post"
+    url: "https://www.thejakartapost.com"
+    rss_feed: "https://www.thejakartapost.com/rss/main.xml"
+    backup_url: "https://www.thejakartapost.com/news"
+    region: "Southeast Asia"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Bangkok Post"
+    url: "https://www.bangkokpost.com"
+    rss_feed: "https://www.bangkokpost.com/rss/data/most-recent.xml"
+    backup_url: "https://www.bangkokpost.com/world"
+    region: "Southeast Asia"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Philippine Daily Inquirer"
+    url: "https://www.inquirer.net"
+    rss_feed: "https://www.inquirer.net/fullfeed"
+    backup_url: "https://www.inquirer.net/news"
+    region: "Southeast Asia"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "VietnamPlus"
+    url: "https://en.vietnamplus.vn"
+    rss_feed: "https://en.vietnamplus.vn/rss/home.rss"
+    backup_url: "https://en.vietnamplus.vn/politics-laws"
+    region: "Southeast Asia"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  # Middle East — deepened coverage (Tier 3)
+
+  - name: "Gulf News"
+    url: "https://gulfnews.com"
+    rss_feed: "https://gulfnews.com/rss/uae"
+    backup_url: "https://gulfnews.com/world"
+    region: "Middle East"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Al-Monitor"
+    url: "https://www.al-monitor.com"
+    rss_feed: "https://www.al-monitor.com/rss.xml"
+    backup_url: "https://www.al-monitor.com/originals"
+    region: "Middle East"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 3
+
+  - name: "Daily Sabah"
+    url: "https://www.dailysabah.com"
+    rss_feed: "https://www.dailysabah.com/rss"
+    backup_url: "https://www.dailysabah.com/world"
+    region: "Turkey"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  # India — deepened coverage (Tier 3)
+
+  - name: "The Wire"
+    url: "https://thewire.in"
+    rss_feed: "https://thewire.in/feed"
+    backup_url: "https://thewire.in/category/politics"
+    region: "India"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Indian Express"
+    url: "https://indianexpress.com"
+    rss_feed: "https://indianexpress.com/feed/"
+    backup_url: "https://indianexpress.com/section/india"
+    region: "India"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Economic Times"
+    url: "https://economictimes.indiatimes.com"
+    rss_feed: "https://economictimes.indiatimes.com/rssfeedstopstories.cms"
+    backup_url: "https://economictimes.indiatimes.com/news"
+    region: "India"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Mint"
+    url: "https://www.livemint.com"
+    rss_feed: "https://www.livemint.com/rss/news"
+    backup_url: "https://www.livemint.com/news/india"
+    region: "India"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  # Western Europe — additional coverage (Tier 3)
+
+  - name: "ANSA"
+    url: "https://www.ansa.it/english"
+    rss_feed: "https://www.ansa.it/english/news/rss.xml"
+    backup_url: "https://www.ansa.it/english/news"
+    region: "Italy"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "The Local"
+    url: "https://www.thelocal.com"
+    rss_feed: "https://www.thelocal.com/feed"
+    backup_url: "https://www.thelocal.com/news"
+    region: "Europe"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  # Australia — business & analysis (Tier 3)
+
+  - name: "The Australian"
+    url: "https://www.theaustralian.com.au"
+    rss_feed: "https://www.theaustralian.com.au/feed"
+    backup_url: "https://www.theaustralian.com.au/nation"
+    region: "Australia"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 3
+
+  - name: "Australian Financial Review"
+    url: "https://www.afr.com"
+    rss_feed: "https://www.afr.com/rss"
+    backup_url: "https://www.afr.com/markets"
+    region: "Australia"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 4
+
+  # Southeast Asia (Tier 3)
+
+  - name: "The Edge Malaysia"
+    url: "https://theedgemalaysia.com"
+    rss_feed: "https://theedgemalaysia.com/feed"
+    backup_url: "https://theedgemalaysia.com/category/business"
+    region: "Southeast Asia"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "The Jakarta Post"
+    url: "https://www.thejakartapost.com"
+    rss_feed: "https://www.thejakartapost.com/rss/main.xml"
+    backup_url: "https://www.thejakartapost.com/news"
+    region: "Southeast Asia"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "GMA News"
+    url: "https://www.gmanetwork.com/news"
+    rss_feed: "https://www.gmanetwork.com/news/rss/news.xml"
+    backup_url: "https://www.gmanetwork.com/news/topstories"
+    region: "Southeast Asia"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Philippine Daily Inquirer"
+    url: "https://www.inquirer.net"
+    rss_feed: "https://www.inquirer.net/fullfeed"
+    backup_url: "https://www.inquirer.net/news"
+    region: "Southeast Asia"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "The Philippine Star"
+    url: "https://www.philstar.com"
+    rss_feed: "https://www.philstar.com/rss/headlines"
+    backup_url: "https://www.philstar.com/headlines"
+    region: "Southeast Asia"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  # East Asia (Tier 3)
+
+  - name: "South China Morning Post"
+    url: "https://www.scmp.com"
+    rss_feed: "https://www.scmp.com/rss/91/feed"
+    backup_url: "https://www.scmp.com/news/asia"
+    region: "East Asia"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 4
+
+  - name: "Asahi Shimbun"
+    url: "https://www.asahi.com/ajw"
+    rss_feed: "https://www.asahi.com/ajw/rss.rdf"
+    backup_url: "https://www.asahi.com/ajw/section/national"
+    region: "East Asia"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  # Middle East (Tier 3)
+
+  - name: "Haaretz"
+    url: "https://www.haaretz.com"
+    rss_feed: "https://www.haaretz.com/srv/haaretz-latest-headlines"
+    backup_url: "https://www.haaretz.com/israel-news"
+    region: "Middle East"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 4
+
+  - name: "The Jerusalem Post"
+    url: "https://www.jpost.com"
+    rss_feed: "https://www.jpost.com/rss/rssfeedsfrontpage.aspx"
+    backup_url: "https://www.jpost.com/middle-east"
+    region: "Middle East"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Tehran Times"
+    url: "https://www.tehrantimes.com"
+    rss_feed: "https://www.tehrantimes.com/rss"
+    backup_url: "https://www.tehrantimes.com/news/iran-news"
+    region: "Middle East"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Arab News"
+    url: "https://www.arabnews.com"
+    rss_feed: "https://www.arabnews.com/rss.xml"
+    backup_url: "https://www.arabnews.com/middle-east"
+    region: "Middle East"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "Saudi Gazette"
+    url: "https://www.saudigazette.com.sa"
+    rss_feed: "https://www.saudigazette.com.sa/rss"
+    backup_url: "https://www.saudigazette.com.sa/section/saudi-arabia"
+    region: "Middle East"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  - name: "The Peninsula"
+    url: "https://www.thepeninsulaqatar.com"
+    rss_feed: "https://www.thepeninsulaqatar.com/rss"
+    backup_url: "https://www.thepeninsulaqatar.com/qatar"
+    region: "Middle East"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+
+  # Ireland (Tier 3)
+
+  - name: "The Irish Times"
+    url: "https://www.irishtimes.com"
+    rss_feed: "https://www.irishtimes.com/cmlink/news-1.1319192"
+    backup_url: "https://www.irishtimes.com/news/world"
+    region: "Europe"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 4
+
+  # Latin America (Tier 3)
+
+  - name: "La Nación"
+    url: "https://www.lanacion.com.ar"
+    rss_feed: "https://www.lanacion.com.ar/feed"
+    backup_url: "https://www.lanacion.com.ar/el-mundo"
+    region: "Latin America"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+    notes: "Primary language Spanish — use for trend detection only, not article generation"
+
+  - name: "O Estado de S. Paulo"
+    url: "https://www.estadao.com.br"
+    rss_feed: "https://www.estadao.com.br/rss/home.xml"
+    backup_url: "https://www.estadao.com.br/internacional"
+    region: "Latin America"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+    notes: "Primary language Portuguese — use for trend detection only, not article generation"
+
+  - name: "El Tiempo"
+    url: "https://www.eltiempo.com"
+    rss_feed: "https://www.eltiempo.com/rss/mundo.xml"
+    backup_url: "https://www.eltiempo.com/mundo"
+    region: "Latin America"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+    notes: "Primary language Spanish — use for trend detection only, not article generation"
+
+  - name: "La Tercera"
+    url: "https://www.latercera.com"
+    rss_feed: "https://www.latercera.com/feed"
+    backup_url: "https://www.latercera.com/mundo"
+    region: "Latin America"
+    language: "en"
+    scrape_method: "newspaper3k"
+    selectors:
+      article_list: ""
+      article_url: ""
+      headline: ""
+      content: ""
+    priority: 3
+    enabled: true
+    rate_limit_delay: 2
+    notes: "Primary language Spanish — use for trend detection only, not article generation"
 
   # ===========================================
   # TIER 5: Regional News (Priority 4)

@@ -5,18 +5,26 @@ Analyzes scraped articles to identify trending topics using NLP.
 Uses sentence embeddings and clustering to group similar articles.
 """
 
+# Import logger before try block so it's available in the except clause.
+from loguru import logger
+
 try:
     from sentence_transformers import SentenceTransformer
     from sklearn.cluster import AgglomerativeClustering
     from sklearn.metrics.pairwise import cosine_similarity
     _HAS_EMBEDDINGS = True
-except ImportError:
+# Capture the actual error so logs show the real cause
+# rather than a generic "not installed" message.
+except ImportError as e:
+    logger.warning(
+        f"sentence-transformers unavailable ({e}), "
+        f"falling back to keyword similarity"
+    )
     _HAS_EMBEDDINGS = False
     SentenceTransformer = None
 
 import numpy as np
 from typing import List, Dict, Optional, Tuple
-from loguru import logger
 from collections import Counter
 import re
 import os
@@ -125,8 +133,9 @@ def extract_topic_name(articles: List[Dict]) -> str:
     """
     Extract a representative topic name from a cluster of articles.
     
-    Uses capitalized words (proper nouns/names) from headlines
-    to create a descriptive topic name.
+    Picks the headline whose embedding is closest to the cluster
+    centroid, then returns its first 7 words.  Falls back to
+    frequency-based word selection when embeddings are unavailable.
     
     Args:
         articles: List of article dictionaries in the cluster.
@@ -134,52 +143,38 @@ def extract_topic_name(articles: List[Dict]) -> str:
     Returns:
         A topic name string.
     """
-    # Combine all headlines
+    # Step A — Centroid-nearest headline (requires embeddings + >1 article)
+    try:
+        model = get_model()
+        if model is not None and len(articles) > 1:
+            headlines = [a.get('heading', '') for a in articles]
+            non_empty = [(i, h) for i, h in enumerate(headlines) if h.strip()]
+            if non_empty:
+                texts = [h for _, h in non_empty]
+                embeddings = model.encode(texts, show_progress_bar=False)
+                centroid = np.mean(embeddings, axis=0)
+                # Closest headline to centroid by L2 distance
+                dists = [np.linalg.norm(emb - centroid) for emb in embeddings]
+                best_idx = int(np.argmin(dists))
+                return ' '.join(texts[best_idx].split()[:7])
+    except Exception:
+        logger.debug("extract_topic_name: embedding path failed, using fallback")
+
+    # Step B — Fallback: top-4 most common significant words
     all_headlines = ' '.join([a.get('heading', '') for a in articles])
-    
-    # Strategy 1: Extract capitalized phrases (names, places, events)
-    # Match sequences of capitalized words
-    proper_nouns = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', all_headlines)
-    
-    if proper_nouns:
-        # Count occurrences
-        noun_counts = Counter(proper_nouns)
-        
-        # Filter out common words that happen to be capitalized
-        filtered_nouns = [
-            (noun, count) for noun, count in noun_counts.items()
-            if noun.lower() not in STOP_WORDS
-            and len(noun) > 2
-            and count >= 1
-        ]
-        
-        if filtered_nouns:
-            # Sort by frequency and length
-            filtered_nouns.sort(key=lambda x: (x[1], len(x[0])), reverse=True)
-            
-            # Take top 2-3 proper nouns
-            top_nouns = [noun for noun, _ in filtered_nouns[:3]]
-            topic = ' '.join(top_nouns[:2])
-            
-            if len(topic) > 5:
-                return topic
-    
-    # Strategy 2: Most common significant words
     words = re.findall(r'\b[A-Za-z]{4,}\b', all_headlines)
     words = [w for w in words if w.lower() not in STOP_WORDS]
-    
+
     if words:
         word_counts = Counter(words)
-        top_words = [word for word, _ in word_counts.most_common(3)]
+        top_words = [word for word, _ in word_counts.most_common(4)]
         return ' '.join(top_words)
-    
-    # Strategy 3: Fallback to first headline
+
+    # Step C — Final fallback: first 6 words of first headline
     if articles:
         first_headline = articles[0].get('heading', 'Unknown Topic')
-        # Take first 5 words
-        words = first_headline.split()[:5]
-        return ' '.join(words)
-    
+        return ' '.join(first_headline.split()[:6])
+
     return "General News"
 
 
@@ -270,11 +265,13 @@ def detect_trends(
         
         # Perform clustering
         if _HAS_EMBEDDINGS:
-            # Scikit-learn AgglomerativeClustering
-            n_clusters = max(2, min(top_n * 3, len(valid_articles) // 2))
-            logger.debug(f"Clustering into {n_clusters} groups...")
+            # Use distance threshold so only genuinely similar articles
+            #  cluster together; avoids forcing unrelated articles into one group.
+            computed_distance_threshold = 1.0 - similarity_threshold
+            logger.debug(f"Clustering with distance_threshold={computed_distance_threshold:.2f}...")
             clustering = AgglomerativeClustering(
-                n_clusters=n_clusters,
+                n_clusters=None,
+                distance_threshold=computed_distance_threshold,
                 metric='precomputed',
                 linkage='average'
             )
