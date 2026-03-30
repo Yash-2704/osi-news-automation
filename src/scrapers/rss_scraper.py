@@ -3,8 +3,13 @@ OSI News Automation System - RSS Feed Scraper
 ==============================================
 Reliable alternative to web scraping using RSS feeds.
 Most news sites provide RSS feeds which are more stable.
+
+The synchronous public API is unchanged. Internally, feed fetching
+uses httpx + tenacity for resilient async I/O, and feedparser.parse()
+is wrapped in asyncio.to_thread() to avoid blocking the event loop.
 """
 
+import asyncio
 import feedparser
 from datetime import datetime
 from loguru import logger
@@ -13,6 +18,16 @@ import time
 import os
 import sys
 from dotenv import load_dotenv
+import logging as _std_logging
+
+import httpx
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    before_sleep_log,
+)
 
 # Add parent to path for imports when running as script
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
@@ -108,6 +123,83 @@ RSS_FEEDS = {
 
 
 # ===========================================
+# ASYNC FEED FETCHING
+# ===========================================
+
+# Standard logging bridge for tenacity's before_sleep_log
+_tenacity_logger = _std_logging.getLogger("tenacity.rss_retry")
+_tenacity_logger.setLevel(_std_logging.WARNING)
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=8),
+    retry=retry_if_exception_type(Exception),
+    before_sleep=before_sleep_log(_tenacity_logger, _std_logging.WARNING),
+    reraise=True,
+)
+async def _fetch_feed_text(url: str) -> Optional[str]:
+    """
+    Fetch raw RSS/Atom XML text using httpx with retry logic.
+
+    Uses a standard RSS user-agent (no TLS impersonation needed for feeds).
+    Returns response text on success, None on final failure.
+    """
+    headers = {
+        "User-Agent": os.getenv("USER_AGENT", "RobinOSI-Bot/1.0 (RSS reader)"),
+        "Accept": "application/rss+xml, application/xml, text/xml, */*",
+    }
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(20.0),
+        follow_redirects=True,
+    ) as client:
+        resp = await client.get(url, headers=headers)
+        resp.raise_for_status()
+        return resp.text
+
+
+async def parse_rss_feed_async(feed_url: str, limit: int = 10) -> List[Dict]:
+    """
+    Async version of parse_rss_feed.
+
+    Fetches the raw feed text via _fetch_feed_text(), then passes it to
+    feedparser.parse() inside asyncio.to_thread() so the CPU-bound XML
+    parsing does not block the event loop.
+    """
+    try:
+        logger.debug(f"Parsing RSS feed: {feed_url}")
+
+        raw = await _fetch_feed_text(feed_url)
+        if not raw:
+            return []
+
+        feed = await asyncio.to_thread(feedparser.parse, raw)
+
+        if feed.bozo and feed.bozo_exception:
+            logger.warning(f"RSS feed parsing issue: {feed.bozo_exception}")
+
+        entries = []
+        for entry in feed.entries[:limit]:
+            article_entry = {
+                "title": entry.get("title", ""),
+                "link": entry.get("link", ""),
+                "published": entry.get("published", ""),
+                "summary": entry.get("summary", ""),
+                "author": entry.get("author", ""),
+            }
+
+            if article_entry["link"]:
+                entries.append(article_entry)
+
+        logger.info(f"Found {len(entries)} entries from RSS feed")
+        return entries
+
+    except Exception as e:
+        logger.error(f"Failed to parse RSS feed {feed_url}: {e}")
+        return []
+
+
+# ===========================================
 # RSS FEED PARSING
 # ===========================================
 
@@ -123,32 +215,32 @@ def parse_rss_feed(feed_url: str, limit: int = 10) -> List[Dict]:
         List of article entry dictionaries.
     """
     try:
-        logger.debug(f"Parsing RSS feed: {feed_url}")
-        
-        feed = feedparser.parse(feed_url)
-        
-        if feed.bozo and feed.bozo_exception:
-            logger.warning(f"RSS feed parsing issue: {feed.bozo_exception}")
-        
-        entries = []
-        for entry in feed.entries[:limit]:
-            article_entry = {
-                "title": entry.get("title", ""),
-                "link": entry.get("link", ""),
-                "published": entry.get("published", ""),
-                "summary": entry.get("summary", ""),
-                "author": entry.get("author", ""),
-            }
-            
-            if article_entry["link"]:
-                entries.append(article_entry)
-        
-        logger.info(f"Found {len(entries)} entries from RSS feed")
-        return entries
-        
-    except Exception as e:
-        logger.error(f"Failed to parse RSS feed {feed_url}: {e}")
-        return []
+        return asyncio.run(parse_rss_feed_async(feed_url, limit))
+    except RuntimeError:
+        # Already inside a running event loop (e.g. called from async context
+        # such as APScheduler or batch_scraper's asyncio.run).
+        # Fall back to direct synchronous feedparser call.
+        logger.debug("Falling back to sync feedparser for nested event loop")
+        try:
+            feed = feedparser.parse(feed_url)
+            if feed.bozo and feed.bozo_exception:
+                logger.warning(f"RSS feed parsing issue: {feed.bozo_exception}")
+            entries = []
+            for entry in feed.entries[:limit]:
+                article_entry = {
+                    "title": entry.get("title", ""),
+                    "link": entry.get("link", ""),
+                    "published": entry.get("published", ""),
+                    "summary": entry.get("summary", ""),
+                    "author": entry.get("author", ""),
+                }
+                if article_entry["link"]:
+                    entries.append(article_entry)
+            logger.info(f"Found {len(entries)} entries from RSS feed")
+            return entries
+        except Exception as e:
+            logger.error(f"Failed to parse RSS feed {feed_url}: {e}")
+            return []
 
 
 def get_articles_from_rss(

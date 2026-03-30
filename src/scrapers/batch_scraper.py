@@ -3,8 +3,13 @@ OSI News Automation System - Batch Scraper
 ===========================================
 Scrapes articles from multiple configured news sources.
 Supports both web scraping and RSS feed methods.
+
+Uses an async pipeline internally (trafilatura + curl_cffi + tenacity)
+while preserving the original synchronous public interface so callers
+like run_automation.py need zero changes.
 """
 
+import asyncio
 import yaml
 from bs4 import BeautifulSoup
 import requests
@@ -17,12 +22,33 @@ import sys
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
 from collections import defaultdict
+import logging as _std_logging
+
+import trafilatura
+import httpx
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    before_sleep_log,
+)
+
+# curl_cffi import guard — may not be available on all deployment targets
+try:
+    from curl_cffi.requests import AsyncSession as CurlSession
+    _CURL_AVAILABLE = True
+except ImportError:
+    _CURL_AVAILABLE = False
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from src.scrapers.news_scraper import scrape_single_article
-from src.scrapers.rss_scraper import parse_rss_feed
+from src.scrapers.news_scraper import extract_location, MAJOR_CITIES
+from src.scrapers.rss_scraper import parse_rss_feed, parse_rss_feed_async
+
+# One-time log guard for curl_cffi fallback
+_CURL_FALLBACK_LOGGED = False
 
 
 # ===========================================
@@ -188,6 +214,63 @@ def extract_article_urls_from_page(source: Dict) -> List[str]:
     except requests.exceptions.Timeout:
         logger.warning(f"Timeout fetching {source['name']}")
         return []
+    except requests.exceptions.HTTPError as e:
+        # --- Fix 2: curl_cffi retry on 403 ---
+        if hasattr(e, 'response') and e.response is not None and e.response.status_code == 403:
+            source_name = source.get('name', 'Unknown')
+            logger.info(f"{source_name}: 403 received, retrying with curl_cffi Chrome impersonation...")
+            try:
+                from curl_cffi.requests import Session as CurlSyncSession
+                with CurlSyncSession(impersonate="chrome110") as s:
+                    timeout = int(os.getenv('REQUEST_TIMEOUT_SECONDS', 30))
+                    curl_resp = s.get(source['url'], timeout=timeout)
+                    curl_resp.raise_for_status()
+                    html = curl_resp.text
+                    logger.info(f"Using curl_cffi for {source_name}")
+                    # Re-run extraction logic on the curl_cffi response
+                    soup = BeautifulSoup(html, 'lxml')
+                    article_urls = []
+                    max_per_source = source.get('max_articles_per_source', 10)
+                    if 'selectors' in source and 'article_url' in source['selectors']:
+                        selector = source['selectors']['article_url']
+                        links = soup.select(selector)
+                        for link in links:
+                            href = link.get('href')
+                            url = normalize_url(href, source['url'])
+                            if url and is_valid_article_url(url, source['url']):
+                                if url not in article_urls:
+                                    article_urls.append(url)
+                                    if len(article_urls) >= max_per_source:
+                                        break
+                    if not article_urls:
+                        common_selectors = [
+                            'article a', 'h2 a', 'h3 a',
+                            '.article a', '.story a', '.news-item a',
+                            '[data-testid*="headline"] a', '[class*="headline"] a',
+                        ]
+                        for selector in common_selectors:
+                            try:
+                                links = soup.select(selector)
+                                for link in links:
+                                    href = link.get('href')
+                                    url = normalize_url(href, source['url'])
+                                    if url and is_valid_article_url(url, source['url']):
+                                        if url not in article_urls:
+                                            article_urls.append(url)
+                                            if len(article_urls) >= max_per_source:
+                                                break
+                                if article_urls:
+                                    break
+                            except Exception:
+                                continue
+                    logger.info(f"Found {len(article_urls)} article URLs from {source_name} via curl_cffi")
+                    return article_urls
+            except Exception as curl_err:
+                logger.error(f"curl_cffi retry also failed for {source.get('name', 'Unknown')}: {curl_err}")
+                return []
+        # --- END Fix 2 ---
+        logger.error(f"Request failed for {source['name']}: {e}")
+        return []
     except requests.exceptions.RequestException as e:
         logger.error(f"Request failed for {source['name']}: {e}")
         return []
@@ -252,6 +335,193 @@ def extract_article_urls(source: Dict, prefer_rss: bool = True) -> List[str]:
     return urls
 
 
+async def extract_article_urls_async(source: Dict, prefer_rss: bool = True) -> List[str]:
+    """
+    Async version of extract_article_urls.
+
+    Directly awaits parse_rss_feed_async() instead of going through the
+    synchronous wrapper, avoiding RuntimeError from nested asyncio.run().
+
+    Args:
+        source: Source configuration dictionary.
+        prefer_rss: If True, try RSS first.
+
+    Returns:
+        List of article URLs.
+    """
+    urls = []
+    source_name = source.get('name', 'Unknown')
+
+    if prefer_rss and 'rss_feed' in source:
+        rss_url = source['rss_feed']
+        max_per_source = source.get('max_articles_per_source', 10)
+        entries = await parse_rss_feed_async(rss_url, limit=max_per_source)
+
+        for entry in entries:
+            if entry.get('link'):
+                urls.append(entry['link'])
+
+        if urls:
+            logger.debug(f"Using RSS for {source_name}: {len(urls)} URLs")
+            return urls
+
+    # Fall back to page scraping (run in thread to avoid blocking)
+    urls = await asyncio.to_thread(extract_article_urls_from_page, source)
+
+    if urls:
+        logger.debug(f"Using page scraping for {source_name}: {len(urls)} URLs")
+
+    return urls
+
+
+# ===========================================
+# ASYNC ARTICLE EXTRACTION
+# ===========================================
+
+# Standard tenacity logger bridge for before_sleep_log
+_tenacity_logger = _std_logging.getLogger("tenacity.retry")
+_tenacity_logger.setLevel(_std_logging.WARNING)
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(Exception),
+    before_sleep=before_sleep_log(_tenacity_logger, _std_logging.WARNING),
+    reraise=True,
+)
+async def _fetch_html(url: str) -> str:
+    """
+    Fetch raw HTML from a URL using curl_cffi (preferred) or httpx (fallback).
+
+    Wrapped in tenacity retry: 3 attempts, exponential backoff.
+    Raises on failure after all retries so the caller can handle it.
+    """
+    global _CURL_FALLBACK_LOGGED
+
+    headers = {
+        "User-Agent": os.getenv("USER_AGENT", "RobinOSI-Bot/1.0"),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+    }
+    timeout_secs = int(os.getenv("REQUEST_TIMEOUT_SECONDS", 30))
+
+    if _CURL_AVAILABLE:
+        async with CurlSession(impersonate="chrome120") as session:
+            resp = await session.get(url, headers=headers, timeout=timeout_secs)
+            resp.raise_for_status()
+            return resp.text
+    else:
+        if not _CURL_FALLBACK_LOGGED:
+            logger.debug("curl_cffi unavailable — falling back to httpx")
+            _CURL_FALLBACK_LOGGED = True
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout_secs),
+            follow_redirects=True,
+        ) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            return resp.text
+
+
+async def _fetch_and_extract(url: str, source_name: str) -> Optional[Dict]:
+    """
+    Fetch a page and extract article content using trafilatura.
+
+    Returns an article dict matching the legacy schema produced by
+    scrape_single_article(), or None on any failure.
+    """
+    try:
+        html_content = await _fetch_html(url)
+    except Exception as e:
+        logger.warning(f"All retries exhausted for {url}: [{type(e).__name__}] {e}")
+        return None
+
+    if not html_content:
+        logger.warning(f"Empty HTML response from: {url}")
+        return None
+
+    # --- Content extraction via trafilatura ---
+    story = trafilatura.extract(
+        html_content,
+        include_comments=False,
+        include_tables=False,
+        no_fallback=False,
+        favor_precision=True,
+        url=url,
+    )
+
+    if not story:
+        logger.warning(f"trafilatura returned no content for: {url}")
+        return None
+
+    # --- Word count guard ---
+    word_count = len(story.split())
+    min_words = int(os.getenv("MIN_ARTICLE_WORDS", 50))
+    if word_count < min_words:
+        logger.warning(
+            f"Article too short ({word_count} words, minimum {min_words}): {url}"
+        )
+        return None
+
+    # --- Metadata extraction ---
+    metadata = trafilatura.extract_metadata(html_content, default_url=url)
+
+    heading = ""
+    authors = []
+    publish_date = datetime.utcnow().isoformat()
+    top_image = ""
+    meta_description = ""
+
+    if metadata:
+        heading = metadata.title or ""
+        if metadata.author:
+            # trafilatura returns author as semicolon-separated string
+            authors = [
+                a.strip() for a in metadata.author.split(";") if a.strip()
+            ]
+        if metadata.date:
+            publish_date = str(metadata.date)
+        top_image = metadata.image or ""
+        meta_description = metadata.description or ""
+
+    if not heading:
+        # Last resort: take first line of story
+        heading = story.split("\n")[0][:200]
+
+    # --- Language detection ---
+    try:
+        from langdetect import detect, LangDetectException
+        sample_text = story[:500] if len(story) > 500 else story
+        language = detect(sample_text)
+    except Exception:
+        language = "en"
+
+    # --- Location extraction ---
+    location = extract_location(story)
+
+    # --- Build the article dict (schema-identical to news_scraper output) ---
+    article_data = {
+        "heading": heading,
+        "story": story,
+        "source_url": url,
+        "source_name": source_name,
+        "authors": authors,
+        "publish_date": publish_date,
+        "top_image": top_image,
+        "location": location,
+        "language": language,
+        "scraped_at": datetime.utcnow().isoformat(),
+        "word_count": word_count,
+        "meta_keywords": [],
+        "meta_description": meta_description,
+    }
+
+    logger.info(f"✅ Scraped: {heading[:50]}... ({word_count} words)")
+    return article_data
+
+
 # ===========================================
 # BATCH SCRAPING
 # ===========================================
@@ -313,6 +583,159 @@ def load_news_sources(
         return []
 
 
+async def _scrape_news_batch_async(
+    max_articles: int,
+    sources: List[Dict],
+    prefer_rss: bool,
+    min_per_source: int,
+    max_per_source: int,
+    session_id: str,
+    run_number: int,
+) -> List[Dict]:
+    """
+    Internal async implementation of the batch scrape loop.
+
+    Fetches articles concurrently within each source using asyncio.gather()
+    and a shared Semaphore(10) to cap total in-flight requests.
+    """
+    # CONSTRAINT 3: create semaphore inside the async function,
+    # not at module level, so it's bound to the current event loop.
+    sem = asyncio.Semaphore(10)
+
+    articles: List[Dict] = []
+    failed_urls: List[str] = []
+    sources_scraped = 0
+    start_time = time.time()
+    source_stats = defaultdict(lambda: {"attempted": 0, "succeeded": 0, "failed": 0})
+
+    logger.info(f"🚀 Starting batch scrape from {len(sources)} sources...")
+    logger.info(f"   Target: {max_articles} articles | Session: {session_id}")
+
+    # --- Fix 1: Pre-fetch all RSS feeds concurrently ---
+    url_tasks = [
+        extract_article_urls_async(source, prefer_rss=prefer_rss)
+        for source in sources
+    ]
+    url_results = await asyncio.gather(*url_tasks, return_exceptions=True)
+    prefetched_urls: Dict[str, List[str]] = {}
+    for source, result in zip(sources, url_results):
+        sname = source.get('name', 'Unknown')
+        if isinstance(result, Exception):
+            logger.warning(f"Pre-fetch failed for {sname}: {result}")
+            prefetched_urls[sname] = []
+        else:
+            prefetched_urls[sname] = result
+    # --- END Fix 1 pre-fetch ---
+
+    async def _bounded_fetch(url, source_name, rate_limit):
+        async with sem:
+            await asyncio.sleep(rate_limit)
+            try:
+                return await _fetch_and_extract(url, source_name)
+            except Exception as e:
+                logger.error(f"Failed to scrape {url}: [{type(e).__name__}] {e}")
+                return None
+
+    for source in sources:
+        if len(articles) >= max_articles:
+            logger.info(f"Reached target of {max_articles} articles")
+            break
+
+        source_name = source.get('name', 'Unknown')
+        logger.info(f"\n📰 Scraping: {source_name} (Priority: {source.get('priority', 5)})")
+
+        try:
+            # Get article URLs from pre-fetched results
+            article_urls = prefetched_urls.get(source_name, [])
+
+            if not article_urls:
+                logger.warning(f"   No articles found from {source_name}")
+                continue
+
+            # Limit URLs per source
+            article_urls = article_urls[:max_per_source]
+            logger.info(f"   Found {len(article_urls)} article URLs")
+
+            rate_limit = source.get('rate_limit_delay', 2)
+
+            # Dynamic per-source cap: spread budget proportionally
+            remaining_sources = max(1, len(sources) - sources.index(source))
+            remaining_budget = max_articles - len(articles)
+            dynamic_cap = max(min_per_source, remaining_budget // remaining_sources)
+            article_urls = article_urls[:dynamic_cap]
+
+            # Launch concurrent fetches for this source
+            tasks = [
+                _bounded_fetch(url, source_name, rate_limit)
+                for url in article_urls
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+
+            source_articles = 0
+            for i, result in enumerate(results):
+                source_stats[source_name]["attempted"] += 1
+                if result is not None:
+                    result['source_region'] = source.get('region', 'Unknown')
+                    result['session_id'] = session_id
+                    result['priority'] = source.get('priority', 5)
+                    articles.append(result)
+                    source_articles += 1
+                    source_stats[source_name]["succeeded"] += 1
+                    logger.info(f"   ✅ [{len(articles)}/{max_articles}] {result['heading'][:50]}...")
+                else:
+                    if i < len(article_urls):
+                        failed_urls.append(article_urls[i])
+                    source_stats[source_name]["failed"] += 1
+
+            if source_articles > 0:
+                sources_scraped += 1
+                logger.info(f"   Scraped {source_articles} articles from {source_name}")
+            else:
+                attempted = source_stats[source_name]["attempted"]
+                if attempted > 0:
+                    logger.warning(
+                        f"   ⚠️  ZERO yield from {source_name} "
+                        f"({attempted} URLs attempted, 0 succeeded). "
+                        f"Check RSS feed or geoblocking."
+                    )
+
+        except Exception as e:
+            logger.error(f"Error processing {source_name}: {e}")
+            continue
+
+    # Calculate duration
+    duration = time.time() - start_time
+
+    # Summary
+    logger.info("\n" + "=" * 60)
+    logger.info("📊 Batch Scrape Summary")
+    logger.info("=" * 60)
+    logger.info(f"   Articles scraped: {len(articles)}")
+    logger.info(f"   Sources used: {sources_scraped}/{len(sources)}")
+    logger.info(f"   Failed URLs: {len(failed_urls)}")
+    logger.info(f"   Duration: {duration:.1f} seconds")
+    logger.info(f"   Session ID: {session_id}")
+    logger.info("=" * 60 + "\n")
+
+    dead_sources = [
+        name for name, s in source_stats.items()
+        if s["attempted"] > 0 and s["succeeded"] == 0
+    ]
+    low_yield_sources = [
+        name for name, s in source_stats.items()
+        if s["attempted"] > 0 and 0 < s["succeeded"] < 2
+    ]
+
+    if dead_sources:
+        logger.warning(f"   🚨 Dead sources  : {', '.join(dead_sources)}")
+    if low_yield_sources:
+        logger.warning(f"   ⚠️  Low yield     : {', '.join(low_yield_sources)}")
+
+    _persist_source_health(session_id, source_stats)
+
+    return articles
+
+
 def scrape_news_batch(
     max_articles: int = 50,
     sources: List[Dict] = None,
@@ -335,13 +758,11 @@ def scrape_news_batch(
         min_per_source: Minimum articles to try from each source.
         max_per_source: Maximum articles per source.
         session_id: Optional session ID to attach to articles.
+        run_number: Optional run counter for tier-based scheduling.
         
     Returns:
         List of successfully scraped article dictionaries.
     """
-    articles = []
-    failed_urls = []
-    
     # Generate session ID if not provided
     if not session_id:
         session_id = f"BATCH_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
@@ -354,116 +775,13 @@ def scrape_news_batch(
         logger.error("No news sources configured")
         return []
     
-    logger.info(f"🚀 Starting batch scrape from {len(sources)} sources...")
-    logger.info(f"   Target: {max_articles} articles | Session: {session_id}")
-    
-    start_time = time.time()
-    sources_scraped = 0
-    
-    source_stats = defaultdict(lambda: {"attempted": 0, "succeeded": 0, "failed": 0})
-
-    for source in sources:
-        if len(articles) >= max_articles:
-            logger.info(f"Reached target of {max_articles} articles")
-            break
-        
-        source_name = source.get('name', 'Unknown')
-        logger.info(f"\n📰 Scraping: {source_name} (Priority: {source.get('priority', 5)})")
-        
-        try:
-            # Get article URLs
-            article_urls = extract_article_urls(source, prefer_rss=prefer_rss)
-            
-            if not article_urls:
-                logger.warning(f"   No articles found from {source_name}")
-                continue
-            
-            # Limit URLs per source
-            article_urls = article_urls[:max_per_source]
-            logger.info(f"   Found {len(article_urls)} article URLs")
-            
-            source_articles = 0
-            rate_limit = source.get('rate_limit_delay', 2)
-            
-            for url in article_urls:
-                if len(articles) >= max_articles:
-                    break
-                
-                # Rate limiting with randomization
-                delay = uniform(rate_limit, rate_limit + 1.5)
-                time.sleep(delay)
-                
-                # Scrape article
-                source_stats[source_name]["attempted"] += 1
-                article_data = scrape_single_article(url, source_name)
-                
-                if article_data:
-                    article_data['source_region'] = source.get('region', 'Unknown')
-                    article_data['session_id'] = session_id
-                    article_data['priority'] = source.get('priority', 5)
-                    articles.append(article_data)
-                    source_articles += 1
-                    source_stats[source_name]["succeeded"] += 1
-                    logger.info(f"   ✅ [{len(articles)}/{max_articles}] {article_data['heading'][:50]}...")
-                else:
-                    failed_urls.append(url)
-                    source_stats[source_name]["failed"] += 1
-                
-                # Dynamic per-source cap: spread budget proportionally across remaining sources
-                remaining_sources = max(1, len(sources) - sources.index(source))
-                remaining_budget = max_articles - len(articles)
-                dynamic_cap = max(min_per_source, remaining_budget // remaining_sources)
-
-                if source_articles >= dynamic_cap:
-                    break
-            
-            if source_articles > 0:
-                sources_scraped += 1
-                logger.info(f"   Scraped {source_articles} articles from {source_name}")
-            else:
-                attempted = source_stats[source_name]["attempted"]
-                if attempted > 0:
-                    logger.warning(
-                        f"   ⚠️  ZERO yield from {source_name} "
-                        f"({attempted} URLs attempted, 0 succeeded). "
-                        f"Check RSS feed or geoblocking."
-                    )
-            
-        except Exception as e:
-            logger.error(f"Error processing {source_name}: {e}")
-            continue
-    
-    # Calculate duration
-    duration = time.time() - start_time
-    
-    # Summary
-    logger.info("\n" + "="*60)
-    logger.info("📊 Batch Scrape Summary")
-    logger.info("="*60)
-    logger.info(f"   Articles scraped: {len(articles)}")
-    logger.info(f"   Sources used: {sources_scraped}/{len(sources)}")
-    logger.info(f"   Failed URLs: {len(failed_urls)}")
-    logger.info(f"   Duration: {duration:.1f} seconds")
-    logger.info(f"   Session ID: {session_id}")
-    logger.info("="*60 + "\n")
-    
-    dead_sources = [
-        name for name, s in source_stats.items()
-        if s["attempted"] > 0 and s["succeeded"] == 0
-    ]
-    low_yield_sources = [
-        name for name, s in source_stats.items()
-        if s["attempted"] > 0 and 0 < s["succeeded"] < 2
-    ]
-
-    if dead_sources:
-        logger.warning(f"   🚨 Dead sources  : {', '.join(dead_sources)}")
-    if low_yield_sources:
-        logger.warning(f"   ⚠️  Low yield     : {', '.join(low_yield_sources)}")
-
-    _persist_source_health(session_id, source_stats)
-
-    return articles
+    return asyncio.run(
+        _scrape_news_batch_async(
+            max_articles, sources, prefer_rss,
+            min_per_source, max_per_source,
+            session_id, run_number
+        )
+    )
 
 
 def scrape_specific_sources(

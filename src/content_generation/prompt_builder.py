@@ -451,7 +451,11 @@ def detect_story_type_v2(
         >>> print(config["name"])  # e.g. "conflict"
     """
     # Build combined text for keyword scanning
-    combined = topic.lower() + " "
+    # NOTE: topic label excluded — it is a thin auto-generated string that
+    # dilutes keyword scores and causes topical clusters to fall below the
+    # threshold of 3, defaulting to "general". Signal comes from headings
+    # and story content only.
+    combined = ""
     for article in articles[:6]:
         combined += article.get("heading", "").lower() + " "
         combined += article.get("story", "")[:400].lower() + " "
@@ -610,6 +614,32 @@ insufficient or that implications cannot be assessed.
 Never write meta-commentary about what you do not have.]"""
     else:
         looking_ahead_block = ""
+
+    # Determine the instruction body for the position-4 section.
+    # When the story type already lists "Looking Ahead" at position 4
+    # (e.g. the "general" type), we must render the forward-looking
+    # instruction inline so the header and instruction always match.
+    # For every other story type, position 4 is a broader-implications
+    # section, so we keep the original broader-implications instruction.
+    _section4_name = story_sections[4].lower() if len(story_sections) > 4 else ""
+    if _section4_name == "looking ahead":
+        section4_instruction = (
+            "[Expand WHAT COMES NEXT from your plan using only confirmed\n"
+            "audit material. Name the upcoming decision, deadline, or open\n"
+            "question. Write what IS known — who is watching, what the\n"
+            "outcome depends on. If sources are thin, write two sentences\n"
+            "on the confirmed open question and stop.\n"
+            "Do NOT write any sentence explaining that source material is\n"
+            "insufficient or that implications cannot be assessed.\n"
+            "Never write meta-commentary about what you do not have.]"
+        )
+    else:
+        section4_instruction = (
+            "[Connect the immediate events to their wider significance —\n"
+            "regional stability, institutional credibility, or precedent-setting\n"
+            "consequences. Ground every claim in your audit material.\n"
+            "End with a sentence that sets up the closing forward-looking section.]"
+        )
 
     user_prompt = f"""You are about to write a news article about: {topic}
 
@@ -802,10 +832,7 @@ that sentence so the reader knows. End with a sentence that raises
 the implications for the region or world.]
 
 ## {story_sections[4] if len(story_sections) > 4 else "Broader Implications"}
-[Connect the immediate events to their wider significance —
-regional stability, institutional credibility, or precedent-setting
-consequences. Ground every claim in your audit material.
-End with a sentence that sets up the closing forward-looking section.]
+{section4_instruction}
 
 {looking_ahead_block}
 

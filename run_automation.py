@@ -195,7 +195,7 @@ def run_pipeline(dry_run: bool = False) -> dict:
         # Read a dedicated clustering threshold — reusing the duplicate
         # detection threshold (0.8) produces distance_threshold=0.20
         # which is too tight and collapses unrelated topics into singletons.
-        similarity_threshold = float(os.getenv('CLUSTER_SIMILARITY_THRESHOLD', 0.50))
+        similarity_threshold = float(os.getenv('CLUSTER_SIMILARITY_THRESHOLD', 0.62))
 
         # Use the actual NLP clustering from trend_analyzer to group similar stories into single trends
         trends = detect_trends(
@@ -244,6 +244,22 @@ def run_pipeline(dry_run: bool = False) -> dict:
                 )
                 continue
 
+            # ── Unique-sources guard ──
+            # Require articles from at least 2 different source outlets.
+            # Multiple articles from the same outlet do not provide the
+            # independent corroboration needed for honest synthesis.
+            unique_sources = {a.get('source_name') for a in trend.get('articles', [])}
+            if len(unique_sources) < 2:
+                logger.warning(
+                    f"⏭️  Skipping '{trend['topic']}' — "
+                    f"only {len(unique_sources)} unique source(s). "
+                    f"Multiple independent sources required."
+                )
+                stats['errors'].append(
+                    f"Skipped (single unique source): {trend['topic']}"
+                )
+                continue
+
             # Guard: skip clusters whose total source words are too few to
             # reach the 700-word minimum without fabrication.
             total_source_words = sum(
@@ -265,7 +281,7 @@ def run_pipeline(dry_run: bool = False) -> dict:
             # Guard: skip clusters with low internal similarity — sources
             # are likely unrelated and will produce contaminated output.
             avg_sim = trend.get('avg_similarity', 0.0)
-            COHERENCE_FLOOR = 0.55
+            COHERENCE_FLOOR = float(os.getenv('COHERENCE_FLOOR', '0.58'))
             if avg_sim < COHERENCE_FLOOR:
                 logger.warning(
                     f"⏭️  Skipping '{trend['topic']}' — "

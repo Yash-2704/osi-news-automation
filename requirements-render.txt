@@ -2,12 +2,17 @@
 # Stripped of local-only packages (torch, diffusers, playwright, social media SDKs)
 # that are not needed in cloud mode.
 # Web Scraping
-newspaper3k==0.2.8
 beautifulsoup4==4.12.2
 lxml==4.9.3
 requests==2.31.0
 feedparser==6.0.10
 langdetect==1.0.9
+trafilatura==2.0.0
+curl_cffi==0.13.0
+selectolax==0.4.7
+tenacity==9.1.2
+httpx==0.28.1
+lxml_html_clean==0.4.4
 
 # NLP & ML — duplicate detection via sentence embeddings
 numpy>=1.24.0,<2.0

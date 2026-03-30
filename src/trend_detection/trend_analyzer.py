@@ -132,48 +132,80 @@ def extract_keywords(articles: List[Dict], top_n: int = 10) -> List[str]:
 def extract_topic_name(articles: List[Dict]) -> str:
     """
     Extract a representative topic name from a cluster of articles.
-    
-    Picks the headline whose embedding is closest to the cluster
-    centroid, then returns its first 7 words.  Falls back to
-    frequency-based word selection when embeddings are unavailable.
-    
+
+    Three-tier approach:
+      1. LLM (Groq) — generates a concise, meaningful label from headlines
+      2. Centroid-nearest headline with natural-boundary truncation
+      3. Final fallback — first 10 words of first headline
+
     Args:
         articles: List of article dictionaries in the cluster.
-        
+
     Returns:
         A topic name string.
     """
-    # Step A — Centroid-nearest headline (requires embeddings + >1 article)
+    # Collect non-empty headlines (shared across all steps)
+    all_headlines = [a.get('heading', '') for a in articles]
+    non_empty_headlines = [h.strip() for h in all_headlines if h.strip()]
+
+    # --- Step 1: LLM-generated label via Groq ---
+    try:
+        groq_api_key = os.environ.get('GROQ_API_KEY', '')
+        if groq_api_key and non_empty_headlines:
+            from groq import Groq
+
+            headline_sample = non_empty_headlines[:8]
+            bullet_list = "\n".join(f"- {h}" for h in headline_sample)
+            prompt = (
+                "Below are headlines from a cluster of news articles about the same story.\n\n"
+                f"{bullet_list}\n\n"
+                "Write a single descriptive label of maximum 10 words that captures "
+                "the essence of this news cluster. The label must:\n"
+                "- Be specific and meaningful\n"
+                "- Not cut off mid-sentence\n"
+                "- Not end with a preposition or conjunction\n"
+                "Return ONLY the label, no explanation, no quotes, no punctuation at the end."
+            )
+
+            groq_model = os.environ.get('GROQ_MODEL', 'llama-3.3-70b-versatile')
+            client = Groq(api_key=groq_api_key)
+            response = client.chat.completions.create(
+                model=groq_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=25,
+            )
+            label = response.choices[0].message.content.strip().strip('"\'.')
+            if label and len(label.split()) <= 15:
+                logger.info(f"LLM trend label: '{label}'")
+                return label
+    except Exception as e:
+        logger.debug(f"extract_topic_name: LLM path failed ({e}), using fallback")
+
+    # --- Step 2: Centroid-nearest headline with natural-boundary truncation ---
     try:
         model = get_model()
-        if model is not None and len(articles) > 1:
-            headlines = [a.get('heading', '') for a in articles]
-            non_empty = [(i, h) for i, h in enumerate(headlines) if h.strip()]
-            if non_empty:
-                texts = [h for _, h in non_empty]
-                embeddings = model.encode(texts, show_progress_bar=False)
-                centroid = np.mean(embeddings, axis=0)
-                # Closest headline to centroid by L2 distance
-                dists = [np.linalg.norm(emb - centroid) for emb in embeddings]
-                best_idx = int(np.argmin(dists))
-                return ' '.join(texts[best_idx].split()[:7])
+        if model is not None and len(non_empty_headlines) > 1:
+            embeddings = model.encode(non_empty_headlines, show_progress_bar=False)
+            centroid = np.mean(embeddings, axis=0)
+            dists = [np.linalg.norm(emb - centroid) for emb in embeddings]
+            best_idx = int(np.argmin(dists))
+            best_headline = non_empty_headlines[best_idx]
+
+            # Natural boundary truncation: try delimiters first
+            for delimiter in [',', ' - ', ':', ' | ']:
+                pos = best_headline.find(delimiter)
+                if pos > 0:
+                    return best_headline[:pos].strip()
+
+            # No delimiter found — return first 10 words
+            return ' '.join(best_headline.split()[:10])
     except Exception:
-        logger.debug("extract_topic_name: embedding path failed, using fallback")
+        logger.debug("extract_topic_name: embedding path failed, using final fallback")
 
-    # Step B — Fallback: top-4 most common significant words
-    all_headlines = ' '.join([a.get('heading', '') for a in articles])
-    words = re.findall(r'\b[A-Za-z]{4,}\b', all_headlines)
-    words = [w for w in words if w.lower() not in STOP_WORDS]
-
-    if words:
-        word_counts = Counter(words)
-        top_words = [word for word, _ in word_counts.most_common(4)]
-        return ' '.join(top_words)
-
-    # Step C — Final fallback: first 6 words of first headline
-    if articles:
-        first_headline = articles[0].get('heading', 'Unknown Topic')
-        return ' '.join(first_headline.split()[:6])
+    # --- Step 3: Final fallback ---
+    if non_empty_headlines:
+        return ' '.join(non_empty_headlines[0].split()[:10])
 
     return "General News"
 
@@ -230,31 +262,39 @@ def detect_trends(
     try:
         logger.info(f"Analyzing {len(articles)} articles for trends...")
         
-        # Extract headlines
-        headlines = [article.get('heading', '') for article in articles]
+        # Build embedding texts: headline + story snippet for richer
+        # semantic signal.  Headlines alone from different outlets
+        # covering the same story use very different wording (cosine
+        # similarity often peaks at ~0.5), making headline-only
+        # clustering far too sparse.
+        embed_texts = []
+        for article in articles:
+            heading = article.get('heading', '')
+            story_snippet = article.get('story', '')[:300]
+            embed_texts.append(f"{heading} {story_snippet}".strip())
         
-        # Filter out empty headlines
-        valid_indices = [i for i, h in enumerate(headlines) if h.strip()]
+        # Filter out empty entries
+        valid_indices = [i for i, t in enumerate(embed_texts) if t.strip()]
         if len(valid_indices) < min_cluster_size:
-            logger.warning("Not enough valid headlines for trend detection")
+            logger.warning("Not enough valid articles for trend detection")
             return []
         
-        valid_headlines = [headlines[i] for i in valid_indices]
+        valid_texts = [embed_texts[i] for i in valid_indices]
         valid_articles = [articles[i] for i in valid_indices]
         
         # Generate similarity matrix (embeddings or keyword fallback)
         model = get_model()
         if model is not None:
-            logger.debug("Generating embeddings...")
-            embeddings = model.encode(valid_headlines, show_progress_bar=False)
+            logger.debug("Generating embeddings from headline + story snippets...")
+            embeddings = model.encode(valid_texts, show_progress_bar=False)
             similarity_matrix = cosine_similarity(embeddings)
         else:
             logger.info("Using keyword-based similarity (sentence-transformers not available)")
-            n = len(valid_headlines)
+            n = len(valid_texts)
             similarity_matrix = np.zeros((n, n))
             for i in range(n):
                 for j in range(i, n):
-                    sim = _keyword_similarity(valid_headlines[i], valid_headlines[j])
+                    sim = _keyword_similarity(valid_texts[i], valid_texts[j])
                     similarity_matrix[i][j] = sim
                     similarity_matrix[j][i] = sim
                 similarity_matrix[i][i] = 1.0
