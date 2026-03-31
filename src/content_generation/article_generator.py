@@ -3,25 +3,34 @@ OSI News Automation System - Article Generator
 ===============================================
 Generates comprehensive news articles from trend clusters using Groq API (LLaMA).
 Synthesizes multiple source articles into one balanced, well-structured article.
+
+Two-stage pipeline:
+  Stage 1 — audit_source_material() audits what the sources can honestly support
+  Stage 2 — generate_article() writes only what the audit approved
 """
 
 import os
 import sys
 import time
 import re
+import instructor
 from datetime import datetime
 from typing import Dict, List, Optional
 from collections import Counter
 
+from pydantic import BaseModel
 from loguru import logger
 from dotenv import load_dotenv
 
+from src.content_generation.models import AuditResult
 from src.content_generation.prompt_builder import (
     extract_article_signals,
     detect_story_type_v2,
     build_synthesis_prompt_v2,
     validate_article_v2,
     parse_generated_article,
+    build_dynamic_prompt,
+    validate_article_dynamic,
     SYSTEM_MESSAGE_V3,
 )
 
@@ -70,7 +79,101 @@ def get_groq_client():
         return None
 
 
+# ===========================================
+# STAGE 1 — SOURCE MATERIAL AUDIT
+# ===========================================
 
+def audit_source_material(articles: List[Dict], topic: str, client) -> AuditResult:
+    """
+    Audit source material to determine what sections the sources can
+    honestly support, before any article generation is attempted.
+
+    Uses instructor + Groq to return a structured AuditResult.
+
+    Args:
+        articles: List of source article dicts.
+        topic:    Trend topic string.
+        client:   Groq client instance.
+
+    Returns:
+        AuditResult with available sections, quality assessment, and
+        an honest word ceiling.
+    """
+    try:
+        # Step 1 — Build compact source digest (up to 6 articles)
+        digest_parts = []
+        for n, article in enumerate(articles[:6], 1):
+            source_name = article.get("source_name", "Unknown")
+            heading = article.get("heading", "No headline")
+            story = article.get("story", "")[:500]
+            digest_parts.append(f"Source {n} ({source_name}): {heading}\n{story}")
+        source_digest = "\n\n".join(digest_parts)
+
+        # Step 2 — Build the audit prompt
+        audit_prompt = f"""Read the source material below for the topic: {topic}
+
+SOURCE MATERIAL:
+{source_digest}
+
+Return a JSON object with the following fields:
+- available_sections: List of section keys the source material can honestly support. Valid values are EXACTLY: "what_happened", "key_facts", "who_is_affected", "background_context", "reactions", "expert_analysis", "looking_ahead". Only include a section if sources genuinely support it.
+- has_direct_quotes: true only if the source material contains text inside quotation marks attributed to a named person.
+- has_named_sources: true if any named person or institution appears in sources.
+- has_statistics: true if any numeric figure appears in sources.
+- primary_location: most specific location where events are occurring, or null if unclear.
+- source_quality: exactly one of "rich", "adequate", "thin". rich = multiple sources with quotes, stats, named people. adequate = some facts and named sources, limited quotes. thin = minimal facts, no quotes, sparse detail.
+- honest_word_ceiling: realistic maximum word count this material can support without fabrication. rich=700-900, adequate=400-600, thin=200-400. Return as an integer.
+
+Be ruthlessly honest:
+- If reactions are not in the sources, do not include "reactions" in available_sections.
+- If there is no forward-looking information, do not include "looking_ahead".
+- Only include "who_is_affected" if sources contain specific named people or communities affected.
+- Only include "reactions" if sources contain direct quotes or named attributed responses.
+- Only include "expert_analysis" if sources contain expert opinion or analytical statements.
+- Set source_quality to "thin" if sources are sparse, lack quotes, and contain fewer than 3 verifiable facts.
+
+Return ONLY the JSON object."""
+
+        # Step 3 — Call Groq using instructor
+        model = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
+        instructor_client = instructor.from_groq(client)
+        audit_result = instructor_client.chat.completions.create(
+            model=model,
+            response_model=AuditResult,
+            max_retries=2,
+            temperature=0.1,
+            max_tokens=400,
+            messages=[
+                {"role": "user", "content": audit_prompt}
+            ],
+        )
+
+        # Step 4 — Log and return
+        logger.info(
+            f"📋 Audit: quality={audit_result.source_quality} | "
+            f"sections={audit_result.available_sections} | "
+            f"ceiling={audit_result.honest_word_ceiling}w"
+        )
+        return audit_result
+
+    except Exception as e:
+        # Step 5 — Fallback on any failure
+        logger.warning(f"Audit call failed ({e}), using default audit result")
+        default_result = AuditResult(
+            available_sections=["what_happened", "key_facts", "background_context"],
+            has_direct_quotes=False,
+            has_named_sources=False,
+            has_statistics=False,
+            primary_location=None,
+            source_quality="thin",
+            honest_word_ceiling=400,
+        )
+        logger.info(
+            f"📋 Audit: quality={default_result.source_quality} | "
+            f"sections={default_result.available_sections} | "
+            f"ceiling={default_result.honest_word_ceiling}w"
+        )
+        return default_result
 
 
 # ===========================================
@@ -136,33 +239,20 @@ def generate_article(
     """
     Generate a comprehensive article from a trend cluster using Groq API.
     
-    Takes multiple source articles about a topic and synthesizes them
-    into one well-structured, comprehensive news article using the V2
-    signal-routed prompt pipeline.
-    
+    Uses a two-stage approach:
+      Stage 1 — Audit source material to determine what can honestly be written
+      Stage 2 — Write only what the audit approved, with dynamic section selection
+
     Args:
         trend: Trend dictionary with 'topic', 'articles', and 'keywords'.
-        target_words: Minimum word count for generated article.
+        target_words: Target word count for generated article.
         max_retries: Maximum retry attempts on failure.
         include_subheadings: Whether to include subheadings.
         
     Returns:
-        Generated article dictionary with:
-        - heading: Article headline
-        - story: Full article text
-        - dateline: Location dateline
-        - timestamp: Generation timestamp
-        - sources_used: List of source names
-        - word_count: Final word count
-        - source_count: Number of source articles used
-        - story_type: Detected story type name string
-        - validation_warnings: List of warning strings (empty if none)
-        
-    Example:
-        >>> article = generate_article(trend_data, target_words=800)
-        >>> print(article['heading'])
-        >>> print(f"Word count: {article['word_count']}")
+        Generated article dictionary or None on failure.
     """
+    # Step 1 — Extract source_articles and topic
     if not trend or 'articles' not in trend:
         logger.error("Invalid trend data provided")
         return None
@@ -174,98 +264,94 @@ def generate_article(
         logger.error("No source articles in trend")
         return None
     
-    # Get Groq client
+    # Step 2 — Get Groq client
     client = get_groq_client()
     
     if not client:
         logger.warning("Groq client unavailable, using fallback")
         return generate_fallback_article(trend)
     
-    # Pre-processing: extract signals and detect story type (deterministic —
-    # run once before retry loop, no value in repeating on retry)
-    signals = extract_article_signals(source_articles)
-    story_type_config = detect_story_type_v2(source_articles, topic, signals)
+    # Step 3 — Audit source material
+    audit = audit_source_material(source_articles, topic, client)
     
-    # Dynamic max_tokens based on target word count
-    max_tokens = min(2300, int(target_words * 1.45) + 300)
+    # Step 4 — Hard stop: thin quality with insufficient sections
+    if audit.source_quality == "thin" and len(audit.available_sections) < 2:
+        logger.warning(
+            f"⏭️ Skipping '{topic}' — audit found insufficient material "
+            f"(quality=thin, sections={audit.available_sections})"
+        )
+        return None
+    
+    # Step 5 — Extract signals
+    signals = extract_article_signals(source_articles)
+    
+    # Step 6 — Build dynamic prompt
+    system_msg, user_prompt = build_dynamic_prompt(
+        source_articles, topic, audit, signals
+    )
+
+    # Capture prompt for dashboard Prompts page
+    prompt_debug = {
+        "system_message": system_msg,
+        "user_prompt":    user_prompt,
+        "model":          os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile'),
+        "captured_at":    datetime.utcnow().isoformat(),
+        "topic":          topic,
+        "source_count":   len(source_articles),
+        "audit_quality":  audit.source_quality,
+        "audit_sections": audit.available_sections,
+    }
+
+    # Step 7 — Calculate max_tokens
+    max_tokens = min(2300, int(audit.honest_word_ceiling * 1.5) + 200)
     
     logger.info(f"🖊️ Generating article for trend: '{topic}'")
     logger.info(f"   Sources: {len(source_articles)} articles")
-    logger.info(f"   Story type: {story_type_config.get('name', 'general')}")
+    logger.info(f"   Audit: quality={audit.source_quality}, ceiling={audit.honest_word_ceiling}w")
     
-    # Attempt generation with retries
-    # NOTE: 'attempt' is a manual counter (not a for-loop variable) so that
-    # rate-limit waits do NOT consume a retry slot. Every code path that
-    # represents a real failure increments attempt explicitly. Rate limit
-    # hits sleep and loop back without incrementing.
+    # Step 8 — Generation retry loop
     attempt = 0
     while attempt < max_retries:
         try:
-            # Build prompt inside retry loop (dateline may change between
-            # attempts if the clock rolls over, and this keeps it clean)
-            system_msg, user_prompt, dateline, _story_type = build_synthesis_prompt_v2(
-                articles=source_articles,
-                topic=topic,
-                signals=signals,
-                story_type_config=story_type_config,
-                target_words=target_words,
-                include_facts_snapshot=include_subheadings,
-            )
-
-            # Call Groq API
-            model = os.getenv('GROQ_MODEL', 'llama3-70b-8192')
-            # ── Prompt debug capture ──
-            prompt_debug = {
-                "model": model,
-                "system_msg": system_msg,
-                "user_prompt": user_prompt,
-                "total_word_estimate": len(user_prompt.split()) + len(system_msg.split()),
-                "story_type": story_type_config.get("name", "general"),
-                "topic": topic,
-                "source_count": len(source_articles),
-                "attempt": attempt + 1,
-                "captured_at": datetime.utcnow().isoformat(),
-            }
-            logger.info(
-                f"Prompt built — model: {model} | "
-                f"~{prompt_debug['total_word_estimate']} words | "
-                f"story type: {prompt_debug['story_type']}"
-            )
-
+            # a) Call Groq API
+            model = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
             response = client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user",   "content": user_prompt},
                 ],
-                temperature=0.28,
+                temperature=0.35,
                 max_tokens=max_tokens,
                 top_p=0.9,
             )
-
-            # Extract generated content
+            
+            # b) Extract generated text
             generated_text = response.choices[0].message.content
-
+            
             if not generated_text:
                 logger.warning(f"Empty response from Groq (attempt {attempt + 1})")
                 attempt += 1
                 continue
-
-            # Parse article
+            
+            # c) Parse article
             article = parse_generated_article(generated_text)
-            article["prompt_debug"] = prompt_debug
-
-            # Basic length check before full validation
-            word_count = len(article['story'].split())
-
-            if word_count < 300:
+            
+            # d) Basic length check
+            word_count = len(article.get("story", "").split())
+            if word_count < 150:
                 logger.warning(f"Article too short ({word_count} words), retrying...")
                 attempt += 1
                 continue
-
-            # V2 post-generation validation
-            validation = validate_article_v2(article, topic, signals, story_type_config)
-
+            
+            # e) Validate with dynamic validator
+            validation = validate_article_dynamic(article, audit)
+            
+            # f) Log all warnings
+            for warning in validation.get("warnings", []):
+                logger.warning(f"Article validation warning: {warning}")
+            
+            # g) Handle validation failures
             if not validation["passes"]:
                 for failure in validation["failures"]:
                     logger.warning(f"Article validation failure: {failure}")
@@ -274,43 +360,42 @@ def generate_article(
                     continue
                 else:
                     logger.error(
-                        "Article failed validation after all retries — returning None"
+                        "Article failed validation after all retries"
                     )
                     return None
-
-            # Log warnings (do not block upload)
-            for warning in validation.get("warnings", []):
-                logger.warning(f"Article validation warning: {warning}")
-
-            # Add metadata
+            
+            # h) Validation passed — add metadata
             article.update({
-                "dateline":             dateline,
-                "topic":                topic,
-                "timestamp":            format_timestamp(),
-                "sources_used":         list({a.get("source_name", "Unknown") for a in source_articles}),
-                "source_count":         len(source_articles),
-                "word_count":           len(article["story"].split()),
-                "keywords":             trend.get("keywords", [])[:10],
-                "generated_at":         datetime.utcnow().isoformat(),
-                "model_used":           model,
-                "story_type":           story_type_config.get("name", "general"),
-                "validation_warnings":  validation.get("warnings", []),
+                "dateline": audit.primary_location.upper() if audit.primary_location else "INTERNATIONAL",
+                "topic": topic,
+                "timestamp": format_timestamp(),
+                "sources_used": list({a.get("source_name", "Unknown") for a in source_articles}),
+                "source_count": len(source_articles),
+                "word_count": len(article.get("story", "").split()),
+                "keywords": trend.get("keywords", [])[:10],
+                "generated_at": datetime.utcnow().isoformat(),
+                "model_used": model,
+                "source_quality": audit.source_quality,
+                "audit_sections": audit.available_sections,
+                "validation_warnings": validation.get("warnings", []),
+                "prompt_debug": prompt_debug,
             })
-
-            logger.info(f"✅ Generated article: '{article['heading'][:50]}...'")
-            logger.info(f"   Word count: {article['word_count']}")
-            logger.info(f"   Dateline: {article['dateline']}")
-
+            
+            # i) Log success
+            logger.info(f"✅ Generated article: '{article['heading'][:60]}...'")
+            logger.info(
+                f"   Words: {article['word_count']} | "
+                f"Quality: {audit.source_quality} | "
+                f"Sections: {audit.available_sections}"
+            )
+            
+            # j) Return article
             return article
-
+        
         except Exception as e:
             error_msg = str(e)
-
-            # ── Rate limit: wait and retry WITHOUT consuming a retry slot ──
-            # Groq returns 429 when the per-minute token quota is exceeded.
-            # Sleep 65s to let the 60s window reset, then retry the same
-            # attempt index. attempt is NOT incremented here — this is
-            # intentional and the core of this fix.
+            
+            # Rate limit: wait and retry WITHOUT consuming a retry slot
             if '429' in error_msg or 'rate' in error_msg.lower():
                 logger.warning(
                     f"⏳ Rate limited by Groq — waiting 65s for quota reset "
@@ -318,22 +403,23 @@ def generate_article(
                     f"retry slot NOT consumed)..."
                 )
                 time.sleep(65)
-                continue  # ← no attempt += 1 here, by design
-
-            # ── Groq timeout: counts as an attempt ──
+                continue  # no attempt += 1, by design
+            
+            # Timeout: counts as an attempt
             if 'timeout' in error_msg.lower():
                 logger.warning(f"Groq API timeout on attempt {attempt + 1}")
                 attempt += 1
                 continue
-
-            # ── All other errors: log and consume attempt ──
+            
+            # All other errors
             logger.error(f"Generation error (attempt {attempt + 1}): {e}")
             attempt += 1
-
+            
             if attempt >= max_retries:
                 logger.error("Max retries reached, using fallback")
                 return generate_fallback_article(trend)
-
+    
+    # Step 9 — After loop exhausted
     return generate_fallback_article(trend)
 
 

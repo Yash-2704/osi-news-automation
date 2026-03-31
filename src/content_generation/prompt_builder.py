@@ -25,6 +25,7 @@ from typing import Dict, List, Optional, Tuple
 from loguru import logger
 
 from src.content_generation.location_extractor import extract_location_and_category
+from src.content_generation.models import AuditResult
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -90,6 +91,7 @@ _OUTLET_LEAK_RE = re.compile(
 # STORY TYPE TAXONOMY — V2
 # ═══════════════════════════════════════════════════════════════════
 
+# DEPRECATED — replaced by two-stage audit approach. Do not call this function.
 STORY_TYPES_V2: Dict = {
     "conflict": {
         "name": "conflict",
@@ -285,6 +287,7 @@ STORY_TYPES_V2: Dict = {
 # SYSTEM MESSAGE — V3
 # ═══════════════════════════════════════════════════════════════════
 
+# DEPRECATED — replaced by two-stage audit approach. Do not call this function.
 SYSTEM_MESSAGE_V3: str = (
     "You are a senior international correspondent with twenty years of "
     "field reporting experience. You write for an educated general "
@@ -428,6 +431,7 @@ def detect_story_type_v2(
     topic: str,
     signals: Dict,
 ) -> Dict:
+    # DEPRECATED — replaced by two-stage audit approach. Do not call this function.
     """
     Classify source articles into one of 8 story types using keyword
     scoring and signal-based boosts.
@@ -556,6 +560,7 @@ def build_synthesis_prompt_v2(
     target_words: int = 800,
     include_facts_snapshot: bool = True,
 ) -> Tuple[str, str, str, str]:
+    # DEPRECATED — replaced by two-stage audit approach. Do not call this function.
     """
     Build a 10-section editorial prompt for article synthesis.
 
@@ -849,6 +854,7 @@ This is journalism, not a form. Write it as a story.
 
 def validate_article_v2(article: Dict, topic: str, signals: Dict,
                         story_type_config: dict = None) -> Dict:
+    # DEPRECATED — replaced by two-stage audit approach. Do not call this function.
     """
     Hard post-generation validator for 10-section articles.
 
@@ -1027,6 +1033,256 @@ def validate_article_v2(article: Dict, topic: str, signals: Dict,
         "failures": failures,
         "warnings": warnings,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# DYNAMIC PROMPT BUILDER — TWO-STAGE AUDIT APPROACH
+# ═══════════════════════════════════════════════════════════════════
+
+
+def build_dynamic_prompt(
+    articles: List[Dict],
+    topic: str,
+    audit: AuditResult,
+    signals: Dict,
+) -> Tuple[str, str]:
+    """
+    Build a dynamic prompt driven by the Stage 1 audit result.
+
+    Only includes sections the audit determined the source material
+    can honestly support. Returns (system_message, user_prompt).
+
+    Args:
+        articles: List of source article dicts.
+        topic:    Trend topic string.
+        audit:    AuditResult from audit_source_material().
+        signals:  Dict from extract_article_signals().
+
+    Returns:
+        Tuple of (system_message, user_prompt).
+    """
+    # Step 1 — Section instructions
+    SECTION_INSTRUCTIONS = {
+        "what_happened": (
+            "## What Happened\n"
+            "Write 2-3 paragraphs covering the core event. Use only facts "
+            "explicitly present in sources. Do not generalise. End with a "
+            "sentence that raises the central tension or unanswered question."
+        ),
+        "key_facts": (
+            "## Key Facts\n"
+            "Write as a tight bulleted list. Include ONLY numbers, dates, "
+            "and verified claims from sources. If fewer than 3 facts are "
+            "available, write fewer than 3 bullets. Do not pad with "
+            "generalisations or summaries."
+        ),
+        "who_is_affected": (
+            "## Who Is Affected\n"
+            "Write 1-2 paragraphs on concrete human impact. Only include "
+            "specific named people or communities from your sources. Do "
+            "not write generic impact statements."
+        ),
+        "background_context": (
+            "## Background\n"
+            "Write 1-2 paragraphs of context that directly explains why "
+            "this story is happening now. Do not write general background "
+            "that could apply to any story on this topic."
+        ),
+        "reactions": (
+            "## Reactions\n"
+            "Include ONLY direct quotes or named attributed responses "
+            "present in your sources. Introduce each with the speaker's "
+            "name and role if stated. If you have no direct quotes, do "
+            "not write this section at all."
+        ),
+        "expert_analysis": (
+            "## Analysis\n"
+            "Label this section clearly as analysis. Write 1-2 paragraphs "
+            "grounding every analytical claim in source material. Do not "
+            "extrapolate. Do not use the word 'increasingly'."
+        ),
+        "looking_ahead": (
+            "## Looking Ahead\n"
+            "Write 2-3 sentences maximum. Include ONLY confirmed upcoming "
+            "events, deadlines, or decisions present in sources. If no "
+            "future event is confirmed, write one sentence naming the "
+            "single open question this story leaves unresolved. Do not "
+            "write general observations or predictions."
+        ),
+    }
+
+    # Step 2 — Build section_block from audit
+    section_block = "\n\n".join(
+        SECTION_INSTRUCTIONS[key]
+        for key in audit.available_sections
+        if key in SECTION_INSTRUCTIONS
+    )
+
+    # Step 3 — Word ceiling
+    word_ceiling = audit.honest_word_ceiling
+
+    # Step 4 — Quote instruction
+    if audit.has_direct_quotes:
+        quote_instruction = (
+            "Direct quotes are present in your sources — use them. "
+            "Introduce each with the speaker's name."
+        )
+    else:
+        quote_instruction = (
+            "Sources contain no direct quotes. Use attributed reported "
+            "speech only: '[Name] said that...' or '[Name] stated that...'. "
+            "Never fabricate quotes."
+        )
+
+    # Step 5 — Quality warning
+    if audit.source_quality == "thin":
+        quality_warning = (
+            "\n⚠️ SOURCE WARNING: Your sources are thin. Write a shorter, "
+            "honest article rather than a longer fabricated one. It is "
+            "better to write 300 accurate words than 800 padded ones. Do "
+            "not invent detail that is not in the sources.\n"
+        )
+    else:
+        quality_warning = ""
+
+    # Step 6 — Source digest
+    source_digest = signals.get("source_digest", "")
+    if not source_digest:
+        source_digest = "\n\n".join(
+            article.get("story", "")[:500] for article in articles
+        )
+
+    # Step 7 — System message
+    system_message = (
+        "You are a senior wire service journalist with twenty years of field reporting experience. "
+        "You write for an educated general audience that expects accuracy, context, and prose "
+        "that respects their intelligence.\n\n"
+
+        "CORE RULES:\n"
+        "- Write only what your sources explicitly state. Never infer, extrapolate, or fill gaps.\n"
+        "- A short truthful article is always better than a long fabricated one.\n"
+        "- If a section cannot be written from source material, skip it entirely.\n"
+        "- Never begin a lede with a social media action (e.g. 'X posted...', 'shared on Truth Social...').\n"
+        "- Attribute statements to named people only when those names appear in the source material.\n"
+        "- Never infer a person's title or role from memory — use only what the source states.\n"
+        "- Follow AP Style throughout. Do not editorialize.\n\n"
+
+        "BANNED PHRASES — never use any of these:\n"
+        "'as the situation continues', 'increasingly important', 'further complicated', "
+        "'regional and global consequences', 'it is becoming clear', 'the situation deteriorates', "
+        "'it is worth noting', 'it remains to be seen', 'in a significant development', "
+        "'amid growing concerns', 'has sparked debate', 'raises questions about', "
+        "'underscored the importance', 'highlighted the need', 'at a critical juncture', "
+        "'crucial', 'landmark', 'historic', 'unprecedented', 'sparking', 'amid'.\n\n"
+
+        "If you find yourself about to write any banned phrase, stop and write a specific "
+        "verified fact from your sources instead, or write nothing."
+    )
+
+    # Step 8 — User prompt
+    user_prompt = f"""Write a news article about: {topic}
+{quality_warning}
+SOURCE MATERIAL:
+{source_digest}
+
+{quote_instruction}
+
+Write the following sections and ONLY these sections, because these are the only ones your source material can honestly support:
+
+{section_block}
+
+Rules:
+- Maximum {word_ceiling} words total
+- Every fact must come directly from the source material above
+- Do not write a section header if you have nothing factual to put under it
+- Do not write any of the banned phrases listed in your instructions
+- AP Style throughout
+- Start with a # headline on the first line
+- Second line must be ### subheadline
+- Then write the article sections
+
+Write now:"""
+
+    # Step 9
+    return (system_message, user_prompt)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# DYNAMIC VALIDATOR — TWO-STAGE AUDIT APPROACH
+# ═══════════════════════════════════════════════════════════════════
+
+
+def validate_article_dynamic(article: Dict, audit: AuditResult) -> Dict:
+    """
+    Validate a generated article against the audit result.
+
+    Enforces banned phrases as hard failures that trigger retry.
+
+    Args:
+        article: Parsed article dict with 'heading', 'story'.
+        audit:   AuditResult from audit_source_material().
+
+    Returns:
+        dict with keys:
+            passes   – bool (True only if failures list is empty)
+            failures – list of failure-reason strings
+            warnings – list of warning strings
+    """
+    failures: List[str] = []
+    warnings: List[str] = []
+
+    # Check 1 — Minimum word count
+    word_count = len(article.get("story", "").split())
+    if word_count < 150:
+        failures.append(f"Article too short: {word_count} words (minimum 150)")
+
+    # Check 2 — Headline present
+    if len(article.get("heading", "").strip().split()) < 4:
+        failures.append("Headline missing or too short")
+
+    # Check 3 — Banned phrases (HARD FAILURE — triggers retry)
+    banned = [
+        "as the situation continues",
+        "increasingly important",
+        "further complicated",
+        "regional and global consequences",
+        "it is becoming clear",
+        "the situation deteriorates",
+        "it is worth noting",
+        "it remains to be seen",
+    ]
+    story_lower = article.get("story", "").lower()
+    found = [p for p in banned if p in story_lower]
+    if found:
+        failures.append(f"Banned filler phrases detected — retry required: {found}")
+
+    # Check 4 — Quote presence when audit indicates quotes available
+    if audit.has_direct_quotes:
+        has_quotes = bool(
+            re.search(
+                r'[\u201c\u201d"\u2018\u2019][^"\u201c\u201d\u201e]{15,}[\u201c\u201d"\u2018\u2019]',
+                article.get("story", ""),
+            )
+        )
+        if not has_quotes:
+            warnings.append(
+                "Audit indicated direct quotes available but none found in output"
+            )
+
+    # Check 5 — Fabrication markers (WARNING only, not failure)
+    fabrication_markers = [
+        "not yet clear from available reporting",
+        "sources do not contain",
+        "no confirmed",
+        "cannot be determined",
+    ]
+    found_markers = [m for m in fabrication_markers if m in story_lower]
+    if found_markers:
+        warnings.append(
+            f"Meta-commentary phrases found in article body — review: {found_markers}"
+        )
+
+    return {"passes": len(failures) == 0, "failures": failures, "warnings": warnings}
 
 
 # ═══════════════════════════════════════════════════════════════════

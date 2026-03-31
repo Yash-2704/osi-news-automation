@@ -658,10 +658,18 @@ async def _scrape_news_batch_async(
 
             rate_limit = source.get('rate_limit_delay', 2)
 
-            # Dynamic per-source cap: spread budget proportionally
+            # Dynamic per-source cap: Tier 1 sources get more articles
+            # because they cover the same global stories and create
+            # natural clustering overlaps.  Lower-tier sources get
+            # proportional shares of the remaining budget.
             remaining_sources = max(1, len(sources) - sources.index(source))
             remaining_budget = max_articles - len(articles)
-            dynamic_cap = max(min_per_source, remaining_budget // remaining_sources)
+            priority = source.get('priority', 5)
+            if priority <= 1:
+                # Tier 1: minimum 5 articles, up to 8
+                dynamic_cap = min(8, max(5, remaining_budget // max(1, remaining_sources)))
+            else:
+                dynamic_cap = max(min_per_source, remaining_budget // remaining_sources)
             article_urls = article_urls[:dynamic_cap]
 
             # Launch concurrent fetches for this source
