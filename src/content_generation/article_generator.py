@@ -100,39 +100,45 @@ def audit_source_material(articles: List[Dict], topic: str, client) -> AuditResu
         an honest word ceiling.
     """
     try:
-        # Step 1 — Build compact source digest (up to 6 articles)
+        # Step 1 — Build compact source digest (up to 12 articles, 1500 chars each)
+        # The larger sample gives the LLM enough material to accurately rate
+        # source quality as "rich" for major stories with many contributors.
         digest_parts = []
-        for n, article in enumerate(articles[:6], 1):
+        for n, article in enumerate(articles[:12], 1):
             source_name = article.get("source_name", "Unknown")
             heading = article.get("heading", "No headline")
-            story = article.get("story", "")[:500]
+            story = article.get("story", "")[:1500]
             digest_parts.append(f"Source {n} ({source_name}): {heading}\n{story}")
         source_digest = "\n\n".join(digest_parts)
 
         # Step 2 — Build the audit prompt
-        audit_prompt = f"""Read the source material below for the topic: {topic}
+        audit_prompt = f"""Analyse these sources for the topic: {topic}
 
 SOURCE MATERIAL:
 {source_digest}
 
-Return a JSON object with the following fields:
-- available_sections: List of section keys the source material can honestly support. Valid values are EXACTLY: "what_happened", "key_facts", "who_is_affected", "background_context", "reactions", "expert_analysis", "looking_ahead". Only include a section if sources genuinely support it.
-- has_direct_quotes: true only if the source material contains text inside quotation marks attributed to a named person.
-- has_named_sources: true if any named person or institution appears in sources.
-- has_statistics: true if any numeric figure appears in sources.
-- primary_location: most specific location where events are occurring, or null if unclear.
-- source_quality: exactly one of "rich", "adequate", "thin". rich = multiple sources with quotes, stats, named people. adequate = some facts and named sources, limited quotes. thin = minimal facts, no quotes, sparse detail.
-- honest_word_ceiling: realistic maximum word count this material can support without fabrication. rich=700-900, adequate=400-600, thin=200-400. Return as an integer.
+Return JSON with these exact keys:
+- has_direct_quotes: true ONLY if quotation marks wrap ≥15 characters attributed to a named person
+- has_named_sources: true if any person or institution is named anywhere in the sources
+- has_statistics: true if any numeric figure is present
+- has_future_event: true if any upcoming deadline, date, or decision is mentioned
+- has_expert_opinion: true if any analytical or interpretive statement by a named expert exists
+- has_impact_data: true if any consequence on another country, market, or population is explicitly stated
+- primary_location: most specific city or country where events occur, or null if unclear
+- source_quality: exactly one of:
+    "rich"     → multiple sources, direct quotes, statistics, named people all present
+    "adequate" → some facts and named sources present, limited or no direct quotes
+    "thin"     → sparse facts, no direct quotes, no named people
+- honest_word_ceiling: integer ceiling based on source quality:
+    rich     → 700–900
+    adequate → 400–600
+    thin     → 180–350
+- available_sections: always return this exact list regardless of source quality:
+    ["lead_paragraph","key_facts","narrative","voices","analysis_context","implications","whats_next"]
 
-Be ruthlessly honest:
-- If reactions are not in the sources, do not include "reactions" in available_sections.
-- If there is no forward-looking information, do not include "looking_ahead".
-- Only include "who_is_affected" if sources contain specific named people or communities affected.
-- Only include "reactions" if sources contain direct quotes or named attributed responses.
-- Only include "expert_analysis" if sources contain expert opinion or analytical statements.
-- Set source_quality to "thin" if sources are sparse, lack quotes, and contain fewer than 3 verifiable facts.
-
-Return ONLY the JSON object."""
+RULES:
+- Be ruthlessly honest about source quality — do not inflate ratings
+- Return ONLY the raw JSON object, no preamble, no markdown fences"""
 
         # Step 3 — Call Groq using instructor
         model = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
@@ -142,7 +148,7 @@ Return ONLY the JSON object."""
             response_model=AuditResult,
             max_retries=2,
             temperature=0.1,
-            max_tokens=400,
+            max_tokens=600,  # Increased from 400 — handles larger 12-source digest
             messages=[
                 {"role": "user", "content": audit_prompt}
             ],
@@ -164,6 +170,9 @@ Return ONLY the JSON object."""
             has_direct_quotes=False,
             has_named_sources=False,
             has_statistics=False,
+            has_future_event=False,
+            has_expert_opinion=False,
+            has_impact_data=False,
             primary_location=None,
             source_quality="thin",
             honest_word_ceiling=400,
@@ -486,7 +495,7 @@ def generate_fallback_article(trend: Dict) -> Optional[Dict]:
 def generate_articles_for_trends(
     trends: List[Dict],
     target_words: int = 800,
-    max_articles: int = 5
+    max_articles: int = 20
 ) -> List[Dict]:
     """
     Generate articles for multiple trends.

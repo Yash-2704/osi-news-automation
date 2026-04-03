@@ -163,10 +163,15 @@ def run_pipeline(dry_run: bool = False) -> dict:
         logger.info("📰 STEP 1: SCRAPING NEWS ARTICLES")
         logger.info("=" * 80)
         
-        max_articles = int(os.getenv('MAX_ARTICLES_PER_RUN', 50))
-        logger.info(f"Target: {max_articles} articles")
-        
-        articles = scrape_news_batch(max_articles=max_articles, run_number=run_number)
+        max_articles = int(os.getenv('MAX_ARTICLES_PER_RUN', 9999))
+        per_source_limit = int(os.getenv('PER_SOURCE_ARTICLE_LIMIT', 10))
+        logger.info(f"Per-source limit: {per_source_limit} articles | Sources loaded: see below")
+
+        articles = scrape_news_batch(
+            max_articles=max_articles,
+            max_per_source=per_source_limit,
+            run_number=run_number
+        )
         
         if not articles:
             logger.error("❌ No articles scraped. Aborting pipeline.")
@@ -189,8 +194,66 @@ def run_pipeline(dry_run: bool = False) -> dict:
         logger.info("\n" + "=" * 80)
         logger.info("🔍 STEP 2: DETECTING TRENDING TOPICS")
         logger.info("=" * 80)
-        
-        top_n_trends = int(os.getenv('TOP_TRENDS_COUNT', 5))
+
+        # ── Pre-clustering noise filter ──────────────────────────────────
+        # Drop articles that would pollute the embedding space and prevent
+        # genuine topics from clustering. Three classes of noise removed:
+        #   1. Too short  — weather bulletins, video captions, paywall stubs
+        #   2. Non-English — foreign-language articles from AFP etc.
+        #   3. Paywall stubs — articles whose content is just the domain URL
+        MIN_ARTICLE_WORDS = int(os.getenv('MIN_ARTICLE_WORDS', 150))
+        articles_before_filter = len(articles)
+        clustering_articles = []
+        skipped_short = 0
+        skipped_nonenglish = 0
+        skipped_stub = 0
+
+        try:
+            from langdetect import detect as _detect_lang
+            _lang_available = True
+        except ImportError:
+            _lang_available = False
+            logger.warning("langdetect not available — skipping language filter")
+
+        for art in articles:
+            story = art.get('story', '')
+            word_count = len(story.split())
+
+            # 1. Word-count floor
+            if word_count < MIN_ARTICLE_WORDS:
+                skipped_short += 1
+                continue
+
+            # 2. Paywall stub — content is just a domain URL (e.g. "www.dailymaverick.co.za")
+            stripped = story.strip()
+            if stripped.startswith('www.') or stripped.startswith('http'):
+                skipped_stub += 1
+                continue
+
+            # 3. Language detection — keep only English
+            if _lang_available:
+                try:
+                    sample = (art.get('heading', '') + ' ' + story[:400]).strip()
+                    if sample and _detect_lang(sample) != 'en':
+                        skipped_nonenglish += 1
+                        continue
+                except Exception:
+                    pass  # langdetect can fail on very short texts — keep article
+
+            clustering_articles.append(art)
+
+        logger.info(
+            f"🧹 Pre-filter: {articles_before_filter} → {len(clustering_articles)} articles "
+            f"(dropped {skipped_short} short, {skipped_stub} stubs, {skipped_nonenglish} non-English)"
+        )
+
+        if not clustering_articles:
+            logger.error("❌ All articles filtered out before clustering. Aborting.")
+            stats['errors'].append("All articles removed by pre-filter")
+            return stats
+        # ─────────────────────────────────────────────────────────────────
+
+        top_n_trends = int(os.getenv('TOP_TRENDS_COUNT', 15))
         min_cluster_size = int(os.getenv('MIN_CLUSTER_SIZE', 1))
         # Read a dedicated clustering threshold — reusing the duplicate
         # detection threshold (0.8) produces distance_threshold=0.20
@@ -199,7 +262,7 @@ def run_pipeline(dry_run: bool = False) -> dict:
 
         # Use the actual NLP clustering from trend_analyzer to group similar stories into single trends
         trends = detect_trends(
-            articles,
+            clustering_articles,
             top_n=top_n_trends,
             min_cluster_size=min_cluster_size,
             similarity_threshold=similarity_threshold

@@ -6,7 +6,7 @@ services:
     repo: https://github.com/Jkavya100/osi-news-automation
     branch: main
     schedule: "0 */3 * * *"       # every 3 hours (UTC)
-    buildCommand: pip install -r requirements-render.txt
+    buildCommand: pip install -r requirements-render.txt && scrapling install
     startCommand: python run_automation.py --mode once
     envVars:
       # ---- Groq LLM ----
@@ -56,3 +56,6 @@ services:
       # ---- Python ----
       - key: PYTHONUNBUFFERED
         value: "1"
+      # ---- Guardian API ----
+      - key: GUARDIAN_API_KEY
+        sync: false

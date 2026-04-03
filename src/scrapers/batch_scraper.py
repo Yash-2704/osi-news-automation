@@ -46,6 +46,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from src.scrapers.news_scraper import extract_location, MAJOR_CITIES
 from src.scrapers.rss_scraper import parse_rss_feed, parse_rss_feed_async
+from src.scrapers.scrapling_fetcher import fetch_with_scrapling
+from src.scrapers.guardian_fetcher import fetch_guardian_articles
 
 # One-time log guard for curl_cffi fallback
 _CURL_FALLBACK_LOGGED = False
@@ -137,6 +139,77 @@ def normalize_url(href: str, base_url: str) -> Optional[str]:
 # URL EXTRACTION
 # ===========================================
 
+
+def _parse_article_urls_from_soup(soup, source: Dict) -> List[str]:
+    """
+    Extract article URLs from a BeautifulSoup-parsed page.
+    Shared helper to avoid duplicating CSS-selector logic.
+    """
+    article_urls = []
+    max_per_source = source.get('max_articles_per_source', 10)
+
+    # Try configured selector first
+    if 'selectors' in source and source['selectors'].get('article_url'):
+        selector = source['selectors']['article_url']
+        links = soup.select(selector)
+        for link in links:
+            href = link.get('href')
+            url = normalize_url(href, source['url'])
+            if url and is_valid_article_url(url, source['url']):
+                if url not in article_urls:
+                    article_urls.append(url)
+                    if len(article_urls) >= max_per_source:
+                        break
+
+    # Fallback: common article link patterns
+    if not article_urls:
+        common_selectors = [
+            'article a', 'h2 a', 'h3 a',
+            '.article a', '.story a', '.news-item a',
+            '[data-testid*="headline"] a', '[class*="headline"] a',
+        ]
+        for selector in common_selectors:
+            try:
+                links = soup.select(selector)
+                for link in links:
+                    href = link.get('href')
+                    url = normalize_url(href, source['url'])
+                    if url and is_valid_article_url(url, source['url']):
+                        if url not in article_urls:
+                            article_urls.append(url)
+                            if len(article_urls) >= max_per_source:
+                                break
+                if article_urls:
+                    break
+            except Exception:
+                continue
+
+    return article_urls
+
+
+def _fetch_page_with_curl_cffi(source: Dict) -> List[str]:
+    """
+    Fallback URL extractor using curl_cffi TLS impersonation.
+    Called when the primary requests.get() path fails for any reason.
+    """
+    source_name = source.get('name', 'Unknown')
+    try:
+        from curl_cffi.requests import Session as CurlSyncSession
+        with CurlSyncSession(impersonate="chrome110") as s:
+            timeout = int(os.getenv('REQUEST_TIMEOUT_SECONDS', 30))
+            resp = s.get(source['url'], timeout=timeout)
+            resp.raise_for_status()
+            html = resp.text
+            logger.info(f"{source_name}: curl_cffi page fetch succeeded")
+            soup = BeautifulSoup(html, 'lxml')
+            urls = _parse_article_urls_from_soup(soup, source)
+            logger.info(f"Found {len(urls)} article URLs from {source_name} via curl_cffi")
+            return urls
+    except Exception as e:
+        logger.warning(f"{source_name}: curl_cffi page fetch also failed: {e}")
+        return []
+
+
 def extract_article_urls_from_page(source: Dict) -> List[str]:
     """
     Extract article URLs from a news source homepage using CSS selectors.
@@ -147,136 +220,38 @@ def extract_article_urls_from_page(source: Dict) -> List[str]:
     Returns:
         List of article URLs.
     """
+    source_name = source.get('name', 'Unknown')
     try:
         logger.debug(f"Extracting URLs from: {source['url']}")
-        
+
         headers = {
             'User-Agent': os.getenv('USER_AGENT', 'RobinOSI-Bot/1.0'),
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
         }
-        
+
         timeout = int(os.getenv('REQUEST_TIMEOUT_SECONDS', 30))
         response = requests.get(source['url'], headers=headers, timeout=timeout)
         response.raise_for_status()
-        
+
         soup = BeautifulSoup(response.content, 'lxml')
-        article_urls = []
-        max_per_source = source.get('max_articles_per_source', 10)
-        
-        # Try configured selector first
-        if 'selectors' in source and 'article_url' in source['selectors']:
-            selector = source['selectors']['article_url']
-            links = soup.select(selector)
-            
-            for link in links:
-                href = link.get('href')
-                url = normalize_url(href, source['url'])
-                
-                if url and is_valid_article_url(url, source['url']):
-                    if url not in article_urls:
-                        article_urls.append(url)
-                        
-                        if len(article_urls) >= max_per_source:
-                            break
-        
-        # Fallback: Try common article link patterns
-        if not article_urls:
-            # Try finding links within article containers
-            common_selectors = [
-                'article a', 'h2 a', 'h3 a',
-                '.article a', '.story a', '.news-item a',
-                '[data-testid*="headline"] a', '[class*="headline"] a',
-            ]
-            
-            for selector in common_selectors:
-                try:
-                    links = soup.select(selector)
-                    for link in links:
-                        href = link.get('href')
-                        url = normalize_url(href, source['url'])
-                        
-                        if url and is_valid_article_url(url, source['url']):
-                            if url not in article_urls:
-                                article_urls.append(url)
-                                
-                                if len(article_urls) >= max_per_source:
-                                    break
-                    
-                    if article_urls:
-                        break
-                except Exception:
-                    continue
-        
-        logger.info(f"Found {len(article_urls)} article URLs from {source['name']}")
+        article_urls = _parse_article_urls_from_soup(soup, source)
+
+        logger.info(f"Found {len(article_urls)} article URLs from {source_name}")
         return article_urls
-        
+
     except requests.exceptions.Timeout:
-        logger.warning(f"Timeout fetching {source['name']}")
-        return []
+        logger.warning(f"{source_name}: timeout, retrying with curl_cffi...")
     except requests.exceptions.HTTPError as e:
-        # --- Fix 2: curl_cffi retry on 403 ---
-        if hasattr(e, 'response') and e.response is not None and e.response.status_code == 403:
-            source_name = source.get('name', 'Unknown')
-            logger.info(f"{source_name}: 403 received, retrying with curl_cffi Chrome impersonation...")
-            try:
-                from curl_cffi.requests import Session as CurlSyncSession
-                with CurlSyncSession(impersonate="chrome110") as s:
-                    timeout = int(os.getenv('REQUEST_TIMEOUT_SECONDS', 30))
-                    curl_resp = s.get(source['url'], timeout=timeout)
-                    curl_resp.raise_for_status()
-                    html = curl_resp.text
-                    logger.info(f"Using curl_cffi for {source_name}")
-                    # Re-run extraction logic on the curl_cffi response
-                    soup = BeautifulSoup(html, 'lxml')
-                    article_urls = []
-                    max_per_source = source.get('max_articles_per_source', 10)
-                    if 'selectors' in source and 'article_url' in source['selectors']:
-                        selector = source['selectors']['article_url']
-                        links = soup.select(selector)
-                        for link in links:
-                            href = link.get('href')
-                            url = normalize_url(href, source['url'])
-                            if url and is_valid_article_url(url, source['url']):
-                                if url not in article_urls:
-                                    article_urls.append(url)
-                                    if len(article_urls) >= max_per_source:
-                                        break
-                    if not article_urls:
-                        common_selectors = [
-                            'article a', 'h2 a', 'h3 a',
-                            '.article a', '.story a', '.news-item a',
-                            '[data-testid*="headline"] a', '[class*="headline"] a',
-                        ]
-                        for selector in common_selectors:
-                            try:
-                                links = soup.select(selector)
-                                for link in links:
-                                    href = link.get('href')
-                                    url = normalize_url(href, source['url'])
-                                    if url and is_valid_article_url(url, source['url']):
-                                        if url not in article_urls:
-                                            article_urls.append(url)
-                                            if len(article_urls) >= max_per_source:
-                                                break
-                                if article_urls:
-                                    break
-                            except Exception:
-                                continue
-                    logger.info(f"Found {len(article_urls)} article URLs from {source_name} via curl_cffi")
-                    return article_urls
-            except Exception as curl_err:
-                logger.error(f"curl_cffi retry also failed for {source.get('name', 'Unknown')}: {curl_err}")
-                return []
-        # --- END Fix 2 ---
-        logger.error(f"Request failed for {source['name']}: {e}")
-        return []
+        status = e.response.status_code if hasattr(e, 'response') and e.response is not None else '?'
+        logger.warning(f"{source_name}: HTTP {status}, retrying with curl_cffi...")
     except requests.exceptions.RequestException as e:
-        logger.error(f"Request failed for {source['name']}: {e}")
-        return []
+        logger.warning(f"{source_name}: {type(e).__name__}, retrying with curl_cffi...")
     except Exception as e:
-        logger.error(f"Failed to extract URLs from {source['name']}: {e}")
-        return []
+        logger.warning(f"{source_name}: URL extraction error ({type(e).__name__}), retrying with curl_cffi...")
+
+    # ── All-failures curl_cffi fallback ──
+    return _fetch_page_with_curl_cffi(source)
 
 
 def extract_article_urls_from_rss(source: Dict) -> List[str]:
@@ -365,11 +340,27 @@ async def extract_article_urls_async(source: Dict, prefer_rss: bool = True) -> L
             logger.debug(f"Using RSS for {source_name}: {len(urls)} URLs")
             return urls
 
-    # Fall back to page scraping (run in thread to avoid blocking)
+    # Tier 2: Fall back to page scraping (requests → curl_cffi fallback)
     urls = await asyncio.to_thread(extract_article_urls_from_page, source)
 
     if urls:
         logger.debug(f"Using page scraping for {source_name}: {len(urls)} URLs")
+        return urls
+
+    # Tier 3: Scrapling homepage fetch as last resort
+    try:
+        scrapling_html = await fetch_with_scrapling(source['url'])
+        if scrapling_html:
+            soup = BeautifulSoup(scrapling_html, 'lxml')
+            urls = _parse_article_urls_from_soup(soup, source)
+            if urls:
+                logger.info(
+                    f"Using Scrapling homepage fetch for {source_name}: "
+                    f"{len(urls)} URLs"
+                )
+                return urls
+    except Exception as e:
+        logger.debug(f"Scrapling homepage fetch failed for {source_name}: {e}")
 
     return urls
 
@@ -425,18 +416,30 @@ async def _fetch_html(url: str) -> str:
             return resp.text
 
 
-async def _fetch_and_extract(url: str, source_name: str) -> Optional[Dict]:
+async def _fetch_and_extract(url: str, source_name: str = "") -> Optional[Dict]:
     """
-    Fetch a page and extract article content using trafilatura.
+    Fetch a page and extract article content using a tiered strategy:
+      Tier 1: Scrapling anti-bot bypass (raw HTML → trafilatura)
+      Tier 2: curl_cffi / httpx fetch → trafilatura
 
     Returns an article dict matching the legacy schema produced by
     scrape_single_article(), or None on any failure.
     """
-    try:
-        html_content = await _fetch_html(url)
-    except Exception as e:
-        logger.warning(f"All retries exhausted for {url}: [{type(e).__name__}] {e}")
-        return None
+    # ── Tier 1: Scrapling — anti-bot bypass (primary) ──
+    scrapling_html = await fetch_with_scrapling(url)
+    if scrapling_html:
+        # Pass the HTML through the existing trafilatura extraction path
+        html_content = scrapling_html
+    else:
+        html_content = None  # existing fetch logic fills this below
+
+    # ── Tier 2: Existing fetch path (curl_cffi / httpx) ──
+    if html_content is None:
+        try:
+            html_content = await _fetch_html(url)
+        except Exception as e:
+            logger.warning(f"All retries exhausted for {url}: [{type(e).__name__}] {e}")
+            return None
 
     if not html_content:
         logger.warning(f"Empty HTML response from: {url}")
@@ -637,10 +640,6 @@ async def _scrape_news_batch_async(
                 return None
 
     for source in sources:
-        if len(articles) >= max_articles:
-            logger.info(f"Reached target of {max_articles} articles")
-            break
-
         source_name = source.get('name', 'Unknown')
         logger.info(f"\n📰 Scraping: {source_name} (Priority: {source.get('priority', 5)})")
 
@@ -652,25 +651,13 @@ async def _scrape_news_batch_async(
                 logger.warning(f"   No articles found from {source_name}")
                 continue
 
-            # Limit URLs per source
-            article_urls = article_urls[:max_per_source]
+            # Respect per-source limit from YAML (max_articles_per_source)
+            # but do NOT apply a global budget cap — scrape everything available.
+            per_source_cap = source.get('max_articles_per_source', max_per_source)
+            article_urls = article_urls[:per_source_cap]
             logger.info(f"   Found {len(article_urls)} article URLs")
 
             rate_limit = source.get('rate_limit_delay', 2)
-
-            # Dynamic per-source cap: Tier 1 sources get more articles
-            # because they cover the same global stories and create
-            # natural clustering overlaps.  Lower-tier sources get
-            # proportional shares of the remaining budget.
-            remaining_sources = max(1, len(sources) - sources.index(source))
-            remaining_budget = max_articles - len(articles)
-            priority = source.get('priority', 5)
-            if priority <= 1:
-                # Tier 1: minimum 5 articles, up to 8
-                dynamic_cap = min(8, max(5, remaining_budget // max(1, remaining_sources)))
-            else:
-                dynamic_cap = max(min_per_source, remaining_budget // remaining_sources)
-            article_urls = article_urls[:dynamic_cap]
 
             # Launch concurrent fetches for this source
             tasks = [
@@ -745,11 +732,11 @@ async def _scrape_news_batch_async(
 
 
 def scrape_news_batch(
-    max_articles: int = 50,
+    max_articles: int = 9999,
     sources: List[Dict] = None,
     prefer_rss: bool = True,
     min_per_source: int = 2,
-    max_per_source: int = 10,
+    max_per_source: int = int(os.getenv('PER_SOURCE_ARTICLE_LIMIT', 10)),
     session_id: str = None,
     run_number: int = None
 ) -> List[Dict]:

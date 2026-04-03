@@ -28,6 +28,15 @@ class AuditResult(BaseModel):
     has_statistics: bool
     # True if any numeric figure appears in sources
 
+    has_future_event: bool
+    # True if any upcoming deadline, date, or decision is mentioned
+
+    has_expert_opinion: bool
+    # True if any analytical/interpretive statement by a named expert exists
+
+    has_impact_data: bool
+    # True if any consequence on another country, market, or population is stated
+
     primary_location: Optional[str]
     # Most specific location where events are occurring, or None
 
