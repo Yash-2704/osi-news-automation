@@ -12,6 +12,8 @@ services:
       # ---- Groq LLM ----
       - key: GROQ_API_KEY
         sync: false
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
       # ---- HuggingFace ----
       - key: HF_ACCESS_TOKEN
         sync: false
@@ -48,6 +50,10 @@ services:
       - key: MAX_ARTICLES_PER_RUN
         value: "5"
       - key: TOP_TRENDS_COUNT
+        value: "2"
+      - key: CLUSTER_SIMILARITY_THRESHOLD
+        value: "0.62"
+      - key: MIN_CLUSTER_SIZE
         value: "2"
       - key: ARTICLE_MIN_WORDS
         value: "800"

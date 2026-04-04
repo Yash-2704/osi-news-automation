@@ -527,7 +527,7 @@ def resolve_dateline(articles: List[Dict]) -> str:
         if location and location.strip() and location.lower() not in ("unknown", "india"):
             city = location.upper().strip()
             now = datetime.now()
-            return f"{city}, {now.strftime('%B')} {now.day}"
+            return f"{city}, {now.strftime('%B')} {now.day}, {now.year}"
     except Exception:
         pass  # fall through to Counter fallback
 
@@ -545,7 +545,7 @@ def resolve_dateline(articles: List[Dict]) -> str:
         city = "NEW DELHI"
 
     now = datetime.now()
-    return f"{city}, {now.strftime('%B')} {now.day}"
+    return f"{city}, {now.strftime('%B')} {now.day}, {now.year}"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1064,7 +1064,7 @@ def build_dynamic_prompt(
     """
     now = datetime.now()
     city = (audit.primary_location or "INTERNATIONAL").upper()
-    dateline = f"{city}, {now.strftime('%B')} {now.day}"
+    dateline = f"{city}, {now.strftime('%B')} {now.day}, {now.year}"
     source_digest = signals.get("source_digest", "")
 
     is_rich = audit.source_quality == "rich"
@@ -1073,35 +1073,53 @@ def build_dynamic_prompt(
     # ── Section 3: Narrative ──
     if is_rich:
         narrative_instruction = (
-            "Write 2-3 paragraphs developing the story chronologically or "
-            "thematically. Connect the lead facts to their causes and "
-            "consequences. Each paragraph must advance the story — do not "
-            "restate the lead. End with the central unresolved tension."
+            "Begin by advancing from where Lead ended — do not restate the cause, "
+            "start date, or any fact already in Lead. "
+            "Write 2-3 paragraphs developing the story chronologically or thematically. "
+            "Weave key numbers, dates, and statistics into the prose at the exact moment "
+            "they become meaningful — do not list them as bullets. "
+            "After each number, write one sentence on its human consequence. "
+            "If a quote from a key actor captures a pivotal moment in the chronology, "
+            "embed it here with one sentence on why that person said it at that moment. "
+            "End with the central unresolved tension."
         )
     elif is_thin:
         narrative_instruction = (
-            "Write 1 paragraph expanding on what is confirmed in sources. "
+            "Begin by advancing from where Lead ended — do not restate any fact "
+            "already in Lead. Write 1 paragraph expanding on what is confirmed in sources. "
+            "Weave any numbers or dates into the prose at the moment they become meaningful — "
+            "do not list them as bullets. After each number, write one sentence on its consequence. "
             "Do not speculate beyond what is explicitly stated."
         )
     else:
         narrative_instruction = (
-            "Write 1-2 paragraphs developing the confirmed facts. "
+            "Begin by advancing from where Lead ended — do not restate any fact "
+            "already in Lead. "
+            "Write 1-2 paragraphs developing confirmed facts. "
+            "Weave key numbers, dates, and statistics into the prose at the moment "
+            "they become meaningful — do not list them as bullets. "
+            "After each number, write one sentence on its consequence. "
             "Show cause and consequence where your sources support it."
         )
 
     # ── Section 4: Voices ──
     if audit.has_direct_quotes:
         voices_instruction = (
-            "Include all direct quotes present in sources. Introduce each "
-            "with the speaker's name and role if stated. After the quotes, "
-            "add one sentence of context explaining why this statement matters."
+            "Open with a one-clause bridge connecting to what just happened in What Happened. "
+            "Use quotes not already embedded in other sections. Introduce each speaker "
+            "with their name and role. After EACH quote, write exactly one sentence "
+            "explaining what the speaker was trying to achieve — not what they said, "
+            "but WHY they said it at this specific moment, and what it cost or gained them. "
+            "If all direct quotes were already used in earlier sections, write attributed "
+            "paraphrases of secondary voices using 'said' or 'told reporters'."
         )
     elif audit.has_named_sources:
         voices_instruction = (
+            "Open with a one-clause bridge connecting to what just happened in What Happened. "
             "No direct quotes are available. Write attributed paraphrases "
             "using 'said', 'stated', or 'told reporters'. Introduce each "
             "with the speaker's name. Do not use quotation marks. "
-            "Minimum one attributed statement."
+            "After each paraphrase, write one sentence on why this person spoke at this moment."
         )
     else:
         voices_instruction = (
@@ -1112,42 +1130,58 @@ def build_dynamic_prompt(
     # ── Section 5: Analysis & Context ──
     if audit.has_expert_opinion and is_rich:
         analysis_instruction = (
-            "Write 2 paragraphs. First: historical or policy context that "
-            "explains why this event is happening now — not general background "
-            "but the specific trigger. Second: label it 'Analysis:' and write "
-            "one paragraph of reasoned interpretation grounded in source material."
+            "Begin with a cause-and-effect bridge from What Happened. "
+            "Write 2 paragraphs. First: historical or policy context explaining "
+            "the specific trigger for this event — not general background. "
+            "If a statistic proves your point, embed it here and follow it with "
+            "one sentence on its human consequence. "
+            "Second: label it 'Analysis:' and write one paragraph of reasoned "
+            "interpretation grounded in source material. "
+            "If expert opinion was not already used in Voices, embed one attributed "
+            "quote or paraphrase here, followed by one sentence on what it reveals "
+            "about the broader significance. "
+            "Do not repeat any statistic or quote already used in prior sections."
         )
     else:
         analysis_instruction = (
-            "Write 1 paragraph of context explaining what led to this event, "
+            "Begin with a cause-and-effect bridge from What Happened. "
+            "Write 1 paragraph of context explaining the specific trigger for this event, "
             "using only what your sources explicitly state. "
-            "Do not write general background that could apply to any story."
+            "If a statistic or attributed statement proves the context, embed it here "
+            "and follow it immediately with its human consequence. "
+            "Do not repeat any fact, statistic, or quote already stated above."
         )
 
     # ── Section 6: Implications ──
     if audit.has_impact_data and not is_thin:
         implications_instruction = (
-            "Write 1-2 paragraphs on regional or global significance. "
-            "Name specific countries, institutions, or markets affected. "
-            "Use only implications that are stated or clearly implied by sources. "
-            "Connect to one measurable consequence — price, policy, population."
+            "Name a specific country, institution, or market not yet mentioned in "
+            "Analysis & Context. Do not repeat any consequence already stated above. "
+            "Write 1-2 paragraphs on significance. "
+            "Connect to one measurable consequence — price, policy, population — "
+            "that traces directly to what the source material states."
         )
     else:
         implications_instruction = (
             "Write one sentence identifying the single most significant "
             "consequence of this event beyond its immediate location, "
-            "using only what sources state."
+            "naming a specific country, market, or institution. "
+            "Use only what sources state — do not repeat what Analysis & Context said."
         )
 
     # ── Section 7: What's Next ──
     if audit.has_future_event:
         next_instruction = (
-            "Write 2-3 sentences on confirmed upcoming events, deadlines, "
+            "Open with a one-clause bridge from Implications — what does that "
+            "consequence mean for what comes next? "
+            "Then write 2-3 sentences on confirmed upcoming events, deadlines, "
             "or decisions from your sources. Name dates and decision-makers."
         )
     else:
         next_instruction = (
-            "Write one sentence posing the single open question this story "
+            "Open with a one-clause bridge from Implications — what does that "
+            "consequence mean for what comes next? "
+            "Then write one sentence posing the single open question this story "
             "leaves unresolved. Write it as a direct question, not a hedge."
         )
 
@@ -1165,14 +1199,54 @@ def build_dynamic_prompt(
     system_message = (
         "You are a senior wire service journalist with twenty years of "
         "field reporting experience writing for an educated general audience.\n\n"
-        "STRUCTURE RULE: Every news article must follow this exact order:\n"
-        "Lead → Key Facts → What Happened → Voices → Analysis & Context → "
-        "Implications → What's Next.\n"
-        "Never reorder sections. Never skip a section. Scale depth to "
-        "source quality, not section count.\n\n"
-        "LEAD RULE: The first paragraph after the dateline answers "
-        "Who, What, Where, When, and Why in 2-3 sentences. "
-        "It does not summarise the whole article — it earns the next paragraph.\n\n"
+        "BEFORE WRITING — identify silently:\n"
+        "1. The single human tension at the center of this story.\n"
+        "2. The emotional arc: what changes from the opening paragraph to the final one "
+        "(e.g. 'isolation → coalition → open question').\n"
+        "3. Which paragraph carries the most narrative weight for this particular story.\n"
+        "Write from those answers. Do not write from the blueprint template.\n\n"
+        "FORMAT RULE: After the headline (# ...) and subheadline (### ...) at the very top, "
+        "divide the article body into sections using ## headers. "
+        "Each ## header must name the specific aspect of THIS story covered in the section "
+        "that follows — never a generic blueprint label. "
+        "Good examples: '## How Iran's Air Defenses Repelled the Strike', "
+        "'## The Factions Tearing the ADC Apart', "
+        "'## Why the Strait of Hormuz Matters to Every Economy'. "
+        "FORBIDDEN generic headers — hard failure if any appear: "
+        "## Lead, ## Background, ## What Happened, ## Voices, ## Analysis & Context, "
+        "## Implications, ## What's Next, ## Key Facts. "
+        "No ③ symbols, no bold section titles. "
+        "The writing blueprint is guidance only — its section labels must never appear in output.\n\n"
+        "STORY RULE: A fact without explanation is data, not journalism. "
+        "Every number, quote, and named claim must be followed immediately by its human meaning — "
+        "why this specific fact matters to a specific person or group right now. "
+        "Never drop a statistic and move on. Never end a quote without saying what it cost "
+        "or gained the person who said it.\n\n"
+        "SCATTER RULE: Place each fact and quote at the paragraph in the story where it lands hardest. "
+        "A quote that illuminates a cause belongs in the development paragraphs. "
+        "A statistic that proves consequence belongs in the stakes paragraph. "
+        "A number that supports analysis belongs in the context paragraph. "
+        "Do not cluster all quotes together or all numbers together.\n\n"
+        "ATTRIBUTION RULE: Attribute every contested or significant claim to its source: "
+        "'According to [institution]...' or '[Name] told reporters...'. "
+        "Never state a disputed fact as if it were settled.\n\n"
+        "OPENING RULE: The first paragraph answers Who, What, Where, When, and Why "
+        "in 2-3 sentences using the single most newsworthy confirmed fact as the opening clause. "
+        "It does not summarise the whole story — it earns the next paragraph.\n\n"
+        "PAIRING RULES — apply everywhere:\n"
+        "Stat rule: immediately after any number write one sentence on its specific human consequence.\n"
+        "Quote rule: immediately after any quote write one sentence on why the speaker said it at "
+        "this specific moment and what it cost or gained them.\n"
+        "Cause rule: every cause you name must be followed by its effect in the next sentence.\n\n"
+        "VARIATION RULE: Before writing each paragraph, look at the first word of the previous "
+        "paragraph. Your new paragraph must open with a different subject, actor, or angle. "
+        "Never start two consecutive paragraphs with the same word or phrase. "
+        "Vary sentence structure, tense, and point of entry across every paragraph.\n\n"
+        "NO-REPETITION RULE: Each paragraph must introduce confirmed information — a fact, quote, "
+        "timeline element, or perspective — not present anywhere earlier in the article. "
+        "Before writing each paragraph ask: 'Does this tell the reader something they cannot "
+        "already infer from what I have written?' If not, delete the paragraph and move to the "
+        "next section. Stop writing when the story is complete; do not pad to reach a word count.\n\n"
         "BANNED PHRASES — hard failure if any appear:\n"
         "'as the situation continues', 'increasingly important', "
         "'further complicated', 'regional and global consequences', "
@@ -1187,53 +1261,88 @@ def build_dynamic_prompt(
         "write a specific verified fact from sources instead."
     )
 
-    user_prompt = f"""Write a news article about: {topic}
+    dev_count = "2-3 paragraphs" if is_rich else ("1 paragraph" if is_thin else "1-2 paragraphs")
+    voices_count = "1-2 paragraphs" if audit.has_direct_quotes else "1 paragraph"
+    context_count = "2 paragraphs" if (audit.has_expert_opinion and is_rich) else "1 paragraph"
+    stakes_count = "1-2 paragraphs" if (audit.has_impact_data and not is_thin) else "1 sentence"
+
+    # Scale the number of required headers by source quality
+    if is_rich:
+        header_rule = "Use 4-5 ## section headers to divide the body (one before each major section)."
+    elif is_thin:
+        header_rule = "Use at most 1 ## section header, or none if the article is under 300 words."
+    else:
+        header_rule = "Use 2-3 ## section headers to divide the body."
+
+    user_prompt = f"""Write a news story about: {topic}
 {quality_warning}
 SOURCE MATERIAL:
 {source_digest}
 
-━━━━━━━━━━━━━━━━━━━━━━━
-ARTICLE STRUCTURE — follow this exact order
-━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT FORMAT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # [Headline — active voice, names who did what, 10-15 words]
 ### [Subheadline — one sentence, max 150 characters, adds context not in headline]
 
-{dateline} —
+{dateline}
 
-## Lead
+[Lead paragraph — no header above it]
+
+## [Story-specific header naming the exact angle of the next section]
+
+[Remaining story sections, each preceded by a ## header]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WRITING BLUEPRINT — instructions only, do NOT copy labels into output
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+① OPENING (2-3 sentences — NO header above this section)
 Write 2-3 sentences answering Who, What, Where, When, Why.
 Use the single most newsworthy confirmed fact as your opening clause.
-Do not summarise the whole article. Earn the next paragraph.
+Do not summarise the whole story. Earn the next paragraph.
 
-## Key Facts
-Bullet list. Include ONLY numbers, dates, and verified claims from sources.
-Write as many bullets as you have confirmed facts. Stop when facts run out.
-Never write a bullet that generalises or summarises.
-
-## What Happened
+② DEVELOPMENT ({dev_count})
+Before this section write a ## header that names the specific development angle
+(e.g. "## How the Strike Unfolded" or "## The Chain of Events That Led Here").
 {narrative_instruction}
 
-## Voices
+③ VOICES ({voices_count})
+Before this section write a ## header that names whose voices dominate
+(e.g. "## What Officials and Witnesses Said" or "## The ADC Responds").
 {voices_instruction}
 
-## Analysis & Context
+④ CONTEXT ({context_count})
+Before this section write a ## header that frames the historical or analytical lens
+(e.g. "## A Rivalry Decades in the Making" or "## Nigeria's Electoral Fault Lines").
 {analysis_instruction}
 
-## Implications
+⑤ STAKES ({stakes_count})
+Before this section write a ## header that names what is concretely at risk
+(e.g. "## The Economic Cost Already Being Felt" or "## What Failure Would Mean").
 {implications_instruction}
 
-## What's Next
+⑥ HORIZON (1 paragraph)
+Before this section write a ## header that signals what comes next
+(e.g. "## The Votes and Decisions Still to Come" or "## What the Crew Does Next").
 {next_instruction}
 
-Rules:
-- Write between {word_floor} and {word_ceiling} words total
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Target {word_floor}–{word_ceiling} words. Hard ceiling: stop at {word_ceiling} words.
+  Do not add paragraphs to reach the floor if the story is already complete.
 - Every fact must trace directly to the source material above
-- Every section must appear — scale depth, never skip
+- All six story elements must appear — scale depth, never skip
+- Each paragraph must introduce new information not stated earlier in the article.
+  Repeating a fact in different words is a writing error — delete and move on.
+- No two consecutive paragraphs may start with the same word or phrase.
+- {header_rule} Headers must be story-specific — never generic blueprint labels.
 - No banned phrases
 - AP Style throughout
 
-Write now:"""
+Write now — output the headline, subheadline, dateline, then the story:"""
 
     return system_message, user_prompt
 
@@ -1273,19 +1382,22 @@ def validate_article_dynamic(article: Dict, audit: AuditResult) -> Dict:
 
     story = article.get("story", "")
 
-    REQUIRED_SECTIONS = [
+    # Check 3 — Accidental section headers (hard failure — LLM disobeyed FORMAT RULE)
+    # These should never appear in output; the LLM was instructed to write continuous prose.
+    ACCIDENTAL_HEADERS = [
         "## Lead",
-        "## Key Facts",
         "## What Happened",
         "## Voices",
         "## Analysis & Context",
         "## Implications",
         "## What's Next",
+        "## Key Facts",
     ]
-
-    for section in REQUIRED_SECTIONS:
-        if section not in story:
-            failures.append(f"Missing required section: {section}")
+    for h in ACCIDENTAL_HEADERS:
+        if h in story:
+            failures.append(
+                f"Accidental section header in prose: '{h}' — FORMAT RULE violated"
+            )
 
     # Check 4 — Quote presence when audit indicates quotes available
     if audit.has_direct_quotes:
@@ -1341,6 +1453,25 @@ def validate_article_dynamic(article: Dict, audit: AuditResult) -> Dict:
         warnings.append(
             f"Meta-commentary phrases found in article body — review: {found_markers}"
         )
+
+    # Check 6 — Consecutive paragraph-start repetition (WARNING only)
+    # Split on blank lines; skip lines that are headers (## ...) or empty.
+    paragraphs = [
+        p.strip() for p in story.split("\n\n")
+        if p.strip() and not p.strip().startswith("#")
+    ]
+    if len(paragraphs) >= 3:
+        for idx in range(len(paragraphs) - 1):
+            words_a = paragraphs[idx].split()
+            words_b = paragraphs[idx + 1].split()
+            first_a = words_a[0].lower().rstrip(".,;:") if words_a else ""
+            first_b = words_b[0].lower().rstrip(".,;:") if words_b else ""
+            if first_a and first_a == first_b:
+                warnings.append(
+                    f"Consecutive paragraphs {idx + 1} and {idx + 2} both start "
+                    f"with '{words_a[0]}' — VARIATION RULE may have been violated"
+                )
+                break  # one warning per article is sufficient
 
     return {"passes": len(failures) == 0, "failures": failures, "warnings": warnings}
 

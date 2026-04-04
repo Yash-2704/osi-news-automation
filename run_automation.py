@@ -20,6 +20,7 @@ Usage:
 
 import sys
 import os
+import re
 import subprocess
 import argparse
 import json
@@ -104,6 +105,111 @@ def setup_logging():
     )
     
     logger.info("Logging configured successfully")
+
+
+# ===========================================
+# ARTICLE & PROMPT FILE SAVING
+# ===========================================
+
+def _make_slug(topic: str) -> str:
+    """Convert a topic string to a safe filename slug."""
+    slug = topic.lower()
+    slug = re.sub(r'[^a-z0-9\s-]', '', slug)
+    slug = re.sub(r'\s+', '-', slug.strip())
+    return slug[:50].rstrip('-')
+
+
+def save_article_to_file(article: dict, session_id: str) -> None:
+    """Save a generated article as a Markdown file under output/articles/YYYY-MM-DD/."""
+    try:
+        generated_at = article.get('generated_at', datetime.now().isoformat())
+        date_str = generated_at[:10]  # YYYY-MM-DD
+        slug = _make_slug(article.get('topic', 'untitled'))
+        trend_idx = article.get('trend_index', 0)
+
+        articles_dir = Path("output/articles") / date_str
+        articles_dir.mkdir(parents=True, exist_ok=True)
+
+        filename = f"{session_id}_{trend_idx+1:02d}_{slug}.md"
+        filepath = articles_dir / filename
+
+        sources = article.get('sources_used', [])
+        sources_str = ', '.join(sources) if sources else 'unknown'
+
+        frontmatter = (
+            f"---\n"
+            f"session_id: {session_id}\n"
+            f"topic: {article.get('topic', '')}\n"
+            f"generated_at: {generated_at}\n"
+            f"word_count: {article.get('word_count', 0)}\n"
+            f"source_count: {article.get('source_count', 0)}\n"
+            f"source_quality: {article.get('source_quality', '')}\n"
+            f"sources_used: [{sources_str}]\n"
+            f"model_used: {article.get('model_used', '')}\n"
+            f"---\n\n"
+        )
+
+        heading = article.get('heading', '')
+        sub_heading = article.get('sub_heading', '')
+        story = article.get('story', '')
+
+        body = f"# {heading}\n\n"
+        if sub_heading:
+            body += f"### {sub_heading}\n\n"
+        body += story
+
+        filepath.write_text(frontmatter + body, encoding='utf-8')
+        logger.debug(f"📄 Article saved: {filepath}")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not save article file: {e}")
+
+
+def save_prompt_to_file(article: dict, session_id: str) -> None:
+    """Save the prompt debug info as a Markdown file under output/prompts/YYYY-MM-DD/."""
+    prompt_debug = article.get('prompt_debug')
+    if not prompt_debug:
+        return
+    try:
+        generated_at = article.get('generated_at', datetime.now().isoformat())
+        date_str = generated_at[:10]
+        slug = _make_slug(article.get('topic', 'untitled'))
+        trend_idx = article.get('trend_index', 0)
+
+        prompts_dir = Path("output/prompts") / date_str
+        prompts_dir.mkdir(parents=True, exist_ok=True)
+
+        filename = f"{session_id}_{trend_idx+1:02d}_{slug}_prompt.md"
+        filepath = prompts_dir / filename
+
+        frontmatter = (
+            f"---\n"
+            f"session_id: {session_id}\n"
+            f"topic: {article.get('topic', '')}\n"
+            f"captured_at: {prompt_debug.get('captured_at', generated_at)}\n"
+            f"model: {prompt_debug.get('model', '')}\n"
+            f"source_count: {prompt_debug.get('source_count', 0)}\n"
+            f"audit_quality: {prompt_debug.get('audit_quality', '')}\n"
+            f"audit_sections: {prompt_debug.get('audit_sections', [])}\n"
+            f"---\n\n"
+        )
+
+        system_msg = prompt_debug.get('system_message', '')
+        user_prompt = prompt_debug.get('user_prompt', '')
+
+        content = (
+            frontmatter
+            + "## SYSTEM MESSAGE\n\n"
+            + system_msg
+            + "\n\n---\n\n"
+            + "## USER PROMPT\n\n"
+            + user_prompt
+            + "\n"
+        )
+
+        filepath.write_text(content, encoding='utf-8')
+        logger.debug(f"📄 Prompt saved: {filepath}")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not save prompt file: {e}")
 
 
 # ===========================================
@@ -254,7 +360,7 @@ def run_pipeline(dry_run: bool = False) -> dict:
         # ─────────────────────────────────────────────────────────────────
 
         top_n_trends = int(os.getenv('TOP_TRENDS_COUNT', 15))
-        min_cluster_size = int(os.getenv('MIN_CLUSTER_SIZE', 1))
+        min_cluster_size = int(os.getenv('MIN_CLUSTER_SIZE', 2))
         # Read a dedicated clustering threshold — reusing the duplicate
         # detection threshold (0.8) produces distance_threshold=0.20
         # which is too tight and collapses unrelated topics into singletons.
@@ -392,7 +498,11 @@ def run_pipeline(dry_run: bool = False) -> dict:
                 # Save to database
                 article_id = db.save_article(article)
                 article['_id'] = article_id
-                
+
+                # Save article and prompt to filesystem
+                save_article_to_file(article, session_id)
+                save_prompt_to_file(article, session_id)
+
             except Exception as e:
                 logger.error(f"❌ Error generating article for trend '{trend['topic']}': {e}")
                 stats['errors'].append(f"Article generation error: {str(e)}")
@@ -637,6 +747,9 @@ Examples:
     logger.info("OSI News Automation System v1.0")
     logger.info(f"Mode: {args.mode}")
     logger.info(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(
+        f"GROQ_MODEL: {os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')}"
+    )
     
     try:
         if args.mode == 'once':

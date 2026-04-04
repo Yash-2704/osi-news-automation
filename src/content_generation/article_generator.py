@@ -42,41 +42,87 @@ load_dotenv()
 
 
 # ===========================================
-# GROQ CLIENT INITIALIZATION
+# GROQ CLIENT POOL — MULTI-KEY ROTATION
 # ===========================================
+# Keys are loaded from GROQ_API_KEY (primary), GROQ_API_KEY_2, _3, _4 …
+# The system rotates to the next key automatically when:
+#   • Transient rate limit persists for 270 s (3 × 90 s waits)
+#   • Daily token quota (TPD) is exhausted — immediate rotation, no wait
 
-_groq_client = None
+_groq_clients: List = []        # ordered pool of Groq client instances
+_current_key_index: int = 0     # index of the currently active client
+
+
+def _build_groq_clients() -> List:
+    """
+    Build the Groq client pool from all GROQ_API_KEY* environment variables.
+    Reads GROQ_API_KEY (key 1), then GROQ_API_KEY_2, GROQ_API_KEY_3, …
+    """
+    from groq import Groq
+
+    keys = []
+    primary = os.getenv('GROQ_API_KEY')
+    if primary:
+        keys.append(primary)
+    for i in range(2, 20):
+        k = os.getenv(f'GROQ_API_KEY_{i}')
+        if k:
+            keys.append(k)
+
+    if not keys:
+        logger.error("No GROQ_API_KEY* variables found in environment")
+        return []
+
+    clients = []
+    for idx, key in enumerate(keys):
+        try:
+            clients.append(Groq(api_key=key))
+            logger.info(f"Groq client {idx + 1}/{len(keys)} ready (…{key[-6:]})")
+        except Exception as e:
+            logger.warning(f"Could not init Groq client {idx + 1} (…{key[-6:]}): {e}")
+
+    logger.info(f"Groq key pool: {len(clients)} key(s) available")
+    return clients
 
 
 def get_groq_client():
+    """Return the currently active Groq client, building the pool on first call."""
+    global _groq_clients, _current_key_index
+
+    if not _groq_clients:
+        try:
+            _groq_clients = _build_groq_clients()
+        except ImportError:
+            logger.error("Groq package not installed. Run: pip install groq")
+            return None
+
+    if not _groq_clients:
+        return None
+
+    return _groq_clients[_current_key_index % len(_groq_clients)]
+
+
+def rotate_groq_key(reason: str = "") -> bool:
     """
-    Get or initialize the Groq client.
-    
+    Rotate to the next Groq API key in the pool.
+
     Returns:
-        Groq client instance or None if API key missing.
+        True  — a different key is now active.
+        False — only one key in pool; rotation not possible.
     """
-    global _groq_client
-    
-    if _groq_client is not None:
-        return _groq_client
-    
-    api_key = os.getenv('GROQ_API_KEY')
-    
-    if not api_key:
-        logger.error("GROQ_API_KEY not found in environment variables")
-        return None
-    
-    try:
-        from groq import Groq
-        _groq_client = Groq(api_key=api_key)
-        logger.info("Groq client initialized successfully")
-        return _groq_client
-    except ImportError:
-        logger.error("Groq package not installed. Run: pip install groq")
-        return None
-    except Exception as e:
-        logger.error(f"Failed to initialize Groq client: {e}")
-        return None
+    global _groq_clients, _current_key_index
+
+    if not _groq_clients or len(_groq_clients) < 2:
+        logger.warning("Groq key rotation requested but pool has only one key.")
+        return False
+
+    old_idx = _current_key_index
+    _current_key_index = (_current_key_index + 1) % len(_groq_clients)
+    logger.warning(
+        f"🔄 Groq key rotated: [{old_idx + 1} → {_current_key_index + 1}] "
+        f"of {len(_groq_clients)} available. Reason: {reason}"
+    )
+    return True
 
 
 # ===========================================
@@ -140,19 +186,20 @@ RULES:
 - Be ruthlessly honest about source quality — do not inflate ratings
 - Return ONLY the raw JSON object, no preamble, no markdown fences"""
 
-        # Step 3 — Call Groq using instructor
+        # Step 3 — Call Groq using JSON mode (avoids tool_use_failed from function-calling)
         model = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
-        instructor_client = instructor.from_groq(client)
-        audit_result = instructor_client.chat.completions.create(
+        import json as _json
+        response = client.chat.completions.create(
             model=model,
-            response_model=AuditResult,
-            max_retries=2,
+            response_format={"type": "json_object"},
             temperature=0.1,
-            max_tokens=600,  # Increased from 400 — handles larger 12-source digest
+            max_tokens=600,
             messages=[
                 {"role": "user", "content": audit_prompt}
             ],
         )
+        data = _json.loads(response.choices[0].message.content)
+        audit_result = AuditResult(**data)
 
         # Step 4 — Log and return
         logger.info(
@@ -319,10 +366,18 @@ def generate_article(
     logger.info(f"   Audit: quality={audit.source_quality}, ceiling={audit.honest_word_ceiling}w")
     
     # Step 8 — Generation retry loop
+    # keys_tried_this_article tracks which key indices have been exhausted so
+    # we avoid cycling back to an already-burned key within the same article.
     attempt = 0
+    keys_tried_this_article: set = set()
     while attempt < max_retries:
         try:
-            # a) Call Groq API
+            # a) Call Groq API — always fetch current active client so rotation
+            #    picked up inside the exception handler is immediately visible.
+            client = get_groq_client()
+            if not client:
+                logger.error("No Groq client available, aborting generation")
+                return generate_fallback_article(trend)
             model = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
             response = client.chat.completions.create(
                 model=model,
@@ -330,19 +385,86 @@ def generate_article(
                     {"role": "system", "content": system_msg},
                     {"role": "user",   "content": user_prompt},
                 ],
-                temperature=0.35,
+                temperature=0.52,
                 max_tokens=max_tokens,
                 top_p=0.9,
             )
             
             # b) Extract generated text
             generated_text = response.choices[0].message.content
-            
+
             if not generated_text:
                 logger.warning(f"Empty response from Groq (attempt {attempt + 1})")
                 attempt += 1
                 continue
-            
+
+            # b2) Post-generation phrase substitutions — applied before validation
+            # Replaces the most persistent banned phrases with safe semantic equivalents.
+            # Only exact case-preserved matches; does not touch "historical", "Unprecedented" etc.
+            _PHRASE_SUBS = [
+                (" sparking ", " prompting "),
+                (" sparking\n", " prompting\n"),
+                ("sparking ", "prompting "),
+                (" amid ", " as "),
+                (" historic ", " notable "),
+                (" historic\n", " notable\n"),
+                ("historic ", "notable "),
+                (" unprecedented ", " unparalleled "),
+                ("unprecedented ", "unparalleled "),
+                (" crucial ", " essential "),
+                ("crucial ", "essential "),
+                ("highlighted the need", "pointed to the need"),
+                ("raises questions about", "draws attention to"),
+            ]
+            for _old, _new in _PHRASE_SUBS:
+                generated_text = generated_text.replace(_old, _new)
+
+            # b3) Fix subtitle heading level — LLM sometimes writes `# Subtitle` or
+            # `## Subtitle` inside a section body instead of the required `### Subtitle`.
+            # Correct any single-hash line that appears after the article headline.
+            _fixed_lines = []
+            _headline_seen = False
+            for _line in generated_text.splitlines():
+                if not _headline_seen and _line.startswith("# ") and not _line.startswith("## "):
+                    _headline_seen = True
+                    _fixed_lines.append(_line)
+                elif _headline_seen and _line.startswith("# ") and not _line.startswith("## "):
+                    # Single-hash subtitle inside body — promote to ###
+                    _fixed_lines.append("##" + _line)
+                else:
+                    _fixed_lines.append(_line)
+            generated_text = "\n".join(_fixed_lines)
+
+            # b4) Strip forbidden generic section headers — LLM may output ## Lead etc.
+            # despite FORMAT RULE. Custom story-specific ## headers are now intentional
+            # and must NOT be stripped; only these specific blueprint labels are removed.
+            _SECTION_HEADERS_TO_STRIP = {
+                "## Lead", "## Background", "## What Happened", "## Voices",
+                "## Analysis & Context", "## Implications", "## What's Next",
+                "## Key Facts",
+            }
+            _cleaned_lines = [
+                _l for _l in generated_text.splitlines()
+                if _l.strip() not in _SECTION_HEADERS_TO_STRIP
+            ]
+            generated_text = "\n".join(_cleaned_lines)
+
+            # b5) Strip incomplete final sentence — ensures article ends on a clean
+            # sentence boundary even when the LLM is cut by the token limit.
+            _trimmed = generated_text.rstrip()
+            if _trimmed and _trimmed[-1] not in {'.', '!', '?', '"', '\u201d', ')'}:
+                _last_end = max(
+                    _trimmed.rfind('.'),
+                    _trimmed.rfind('!'),
+                    _trimmed.rfind('?'),
+                    _trimmed.rfind('\u201d'),
+                )
+                # Only trim if the cut point is in the last 30% of the text —
+                # prevents accidentally gutting a genuinely short article.
+                if _last_end > len(_trimmed) * 0.70:
+                    generated_text = _trimmed[:_last_end + 1] + "\n"
+                    logger.debug("b5) Trimmed incomplete final sentence from article.")
+
             # c) Parse article
             article = parse_generated_article(generated_text)
             
@@ -403,32 +525,79 @@ def generate_article(
         
         except Exception as e:
             error_msg = str(e)
-            
-            # Rate limit: wait and retry WITHOUT consuming a retry slot
-            if '429' in error_msg or 'rate' in error_msg.lower():
-                logger.warning(
-                    f"⏳ Rate limited by Groq — waiting 65s for quota reset "
-                    f"(attempt {attempt + 1}/{max_retries} preserved, "
-                    f"retry slot NOT consumed)..."
+
+            # ── Rate-limit handling ──────────────────────────────────────────
+            if '429' in error_msg or 'rate_limit_exceeded' in error_msg.lower() \
+                    or ('rate' in error_msg.lower() and 'limit' in error_msg.lower()):
+
+                # Detect daily TPD exhaustion:
+                #   "tokens per day" in the message, or wait time is in hours
+                #   e.g. "Please try again in 1h9m27.072s"
+                is_daily_limit = (
+                    'tokens per day' in error_msg.lower()
+                    or 'tpd' in error_msg.lower()
+                    or bool(re.search(r'try again in \d+h', error_msg.lower()))
                 )
-                time.sleep(65)
-                continue  # no attempt += 1, by design
-            
-            # Timeout: counts as an attempt
+
+                if is_daily_limit:
+                    # Daily quota gone — no point waiting; rotate key immediately.
+                    logger.warning(
+                        f"🚫 Daily TPD quota exhausted on Groq key "
+                        f"[{_current_key_index + 1}/{len(_groq_clients or [None])}]. "
+                        f"Rotating to next key immediately..."
+                    )
+                    keys_tried_this_article.add(_current_key_index)
+                    all_keys_count = len(_groq_clients) if _groq_clients else 1
+                    if len(keys_tried_this_article) >= all_keys_count:
+                        logger.error("All Groq keys have hit their daily TPD limit.")
+                        return generate_fallback_article(trend)
+                    rotated = rotate_groq_key("daily TPD quota exhausted")
+                    if not rotated:
+                        logger.error("Key rotation failed (single key pool).")
+                        return generate_fallback_article(trend)
+                    attempt = 0   # fresh attempt counter for the new key
+                    continue
+
+                else:
+                    # Transient rate limit — wait 90 s and consume an attempt.
+                    # After max_retries × 90 s = 270 s, rotate key.
+                    attempt += 1
+                    logger.warning(
+                        f"⏳ Rate limited by Groq (key {_current_key_index + 1}) — "
+                        f"waiting 90s (attempt {attempt}/{max_retries}, "
+                        f"270s total before key rotation)..."
+                    )
+                    time.sleep(90)
+                    if attempt >= max_retries:
+                        # 270 s elapsed — escalate to next key
+                        keys_tried_this_article.add(_current_key_index)
+                        all_keys_count = len(_groq_clients) if _groq_clients else 1
+                        if len(keys_tried_this_article) >= all_keys_count:
+                            logger.error("All Groq keys rate-limited after 270 s each.")
+                            return generate_fallback_article(trend)
+                        rotated = rotate_groq_key(
+                            f"transient rate limit persisted for {max_retries * 90}s"
+                        )
+                        if rotated:
+                            attempt = 0  # fresh attempt counter for the new key
+                    continue
+
+            # ── Timeout ─────────────────────────────────────────────────────
             if 'timeout' in error_msg.lower():
-                logger.warning(f"Groq API timeout on attempt {attempt + 1}")
+                logger.warning(
+                    f"⏱ Groq API timeout on attempt {attempt + 1}/{max_retries}"
+                )
                 attempt += 1
                 continue
-            
-            # All other errors
+
+            # ── All other errors ─────────────────────────────────────────────
             logger.error(f"Generation error (attempt {attempt + 1}): {e}")
             attempt += 1
-            
             if attempt >= max_retries:
                 logger.error("Max retries reached, using fallback")
                 return generate_fallback_article(trend)
-    
-    # Step 9 — After loop exhausted
+
+    # Step 9 — After loop exhausted without success
     return generate_fallback_article(trend)
 
 
