@@ -339,6 +339,16 @@ def _build_repair_instructions(failures: list, word_ceiling: int) -> str:
                 "6 words in active voice: who did what."
             )
 
+        elif "forbidden generic section header" in f_lower:
+            instructions.append(
+                "• SECTION HEADER: Your previous response used a generic "
+                "section header that is forbidden. Replace it with a header "
+                "that names the specific angle of THIS story — for example, "
+                "not '## The Human Cost' but '## How a Drone Hit a Market "
+                "at 9:50 a.m. in Nikopol'. The header must be unique to "
+                "this article and could not appear in a different story."
+            )
+
         else:
             # Catch-all for any future failure type
             instructions.append(

@@ -86,6 +86,36 @@ _OUTLET_LEAK_RE = re.compile(
     re.IGNORECASE,
 )
 
+# RSS scrapers frequently capture navigation text as speaker names
+# via _QUOTE_RE's capitalised-word capture group. This blocklist
+# maps known artifacts to "unnamed official" before quotes are
+# stored or injected into generation prompts.
+_INVALID_SPEAKERS: frozenset = frozenset({
+    "stalled", "stalled negotiations", "related stories",
+    "recommended stories", "read more", "developing story",
+    "breaking news", "editor's note", "advertisement",
+    "subscribe", "newsletter", "sign up", "follow us",
+    "share", "comments", "loading", "updated", "published",
+})
+
+# Generic section headers that the model must never use. These labels
+# name a category of information rather than the specific angle of the
+# story being written. Defined here so validate_article_dynamic() can
+# enforce them as hard failures and build_dynamic_prompt() can reference
+# the same canonical list in future if needed.
+_FORBIDDEN_HEADERS: frozenset = frozenset({
+    "the escalating conflict", "the human cost",
+    "the humanitarian crisis", "the response",
+    "the diplomatic efforts", "the broader context",
+    "the economic cost", "the international context",
+    "the implications", "the potential consequences",
+    "the road ahead", "what comes next", "looking ahead",
+    "background", "what happened", "voices",
+    "analysis & context", "key facts", "lead",
+    "the scale of the attacks", "the response from",
+    "the broader implications", "the international response",
+})
+
 
 # ═══════════════════════════════════════════════════════════════════
 # STORY TYPE TAXONOMY — V2
@@ -362,6 +392,9 @@ def extract_article_signals(articles: List[Dict]) -> Dict:
         for match in _QUOTE_RE.finditer(story):
             quote_text = match.group(1).strip()
             speaker = match.group(2).strip() if match.group(2) else "unnamed official"
+            # Sanitise speaker: reject RSS navigation artifacts
+            if speaker.lower().strip() in _INVALID_SPEAKERS:
+                speaker = "unnamed official"
             # De-duplicate by checking if similar text already captured
             if not any(q["text"][:40] == quote_text[:40] for q in quotes):
                 quotes.append({"text": quote_text, "speaker": speaker})
@@ -1323,6 +1356,14 @@ def build_dynamic_prompt(
         "Stat rule: immediately after any number write one sentence on its specific human consequence.\n"
         "Quote rule: immediately after any quote write one sentence on why the speaker said it at "
         "this specific moment and what it cost or gained them.\n"
+        "  BAD (forbidden): 'She said this to emphasize the need for a "
+        "ceasefire.' — this restates the quote's topic, names no specific "
+        "consequence, and could follow any quote in any article.\n"
+        "  GOOD: 'Svyrydenko named Russia's tactics publicly because EU "
+        "defence ministers were meeting in Brussels the next morning and "
+        "she needed their attention before the session opened.' — this names "
+        "a specific actor, a specific moment, and a specific strategic "
+        "consequence that is unique to this quote at this time.\n"
         "Cause rule: every cause you name must be followed by its effect in the next sentence.\n\n"
         "VARIATION RULE: Before writing each paragraph, look at the first word of the previous "
         "paragraph. Your new paragraph must open with a different subject, actor, or angle. "
@@ -1484,6 +1525,18 @@ def validate_article_dynamic(article: Dict, audit: AuditResult) -> Dict:
         failures.append("Headline missing or too short")
 
     story = article.get("story", "")
+
+    # Check 1c — Forbidden generic section headers (hard failure)
+    # Headers must name the specific angle of THIS story. The following
+    # generic category labels are forbidden regardless of capitalisation.
+    found_headers = re.findall(r'^## (.+)$', story, re.MULTILINE)
+    for h in found_headers:
+        if h.strip().lower() in _FORBIDDEN_HEADERS:
+            failures.append(
+                f"Forbidden generic section header: '## {h.strip()}'. "
+                f"Write a story-specific header naming the exact angle "
+                f"of this section — never a category label."
+            )
 
     # Check 3 — Accidental blueprint section headers (hard failure)
     # These exact blueprint labels must never appear; they indicate the model

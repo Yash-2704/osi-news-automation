@@ -122,6 +122,16 @@ class TestSystemMessageRules:
         system_message, _ = _build_prompt()
         assert "PAIRING RULES" in system_message, "PAIRING RULES missing from system_message"
 
+    def test_quote_rule_has_bad_good_contrast(self):
+        """Quote rule must contain a BAD (forbidden) and a GOOD example to prevent boilerplate."""
+        system_message, _ = _build_prompt()
+        assert "BAD (forbidden):" in system_message, (
+            "Quote rule missing BAD (forbidden) contrast example in PAIRING RULES"
+        )
+        assert "GOOD:" in system_message, (
+            "Quote rule missing GOOD contrast example in PAIRING RULES"
+        )
+
     def test_no_structure_rule(self):
         """STRUCTURE RULE (referencing ordered ## sections) must be gone."""
         system_message, _ = _build_prompt()
@@ -390,6 +400,36 @@ class TestValidateArticleDynamic:
         assert not result["passes"]
         assert any("crucial" in f.lower() for f in result["failures"])
 
+    def test_fails_with_forbidden_generic_header(self):
+        """'## The Human Cost' must trigger a hard failure via _FORBIDDEN_HEADERS check."""
+        from src.content_generation.prompt_builder import validate_article_dynamic
+        from src.content_generation.models import AuditResult
+        audit = AuditResult(
+            source_quality="rich",
+            honest_word_ceiling=700,
+            available_sections=[],
+            has_direct_quotes=False,
+            has_named_sources=True,
+            has_statistics=True,
+            has_future_event=False,
+            has_expert_opinion=False,
+            has_impact_data=False,
+            primary_location=None,
+        )
+        article = {
+            "heading": "Test headline for forbidden header check",
+            "story": (
+                "Lead paragraph here with sufficient content.\n\n"
+                "## The Human Cost\n\n"
+                "Body paragraph here." + " word" * 160
+            ),
+        }
+        result = validate_article_dynamic(article, audit)
+        assert result["passes"] is False, "Forbidden generic header should cause hard failure"
+        assert any(
+            "forbidden generic section header" in f.lower() for f in result["failures"]
+        ), f"Expected forbidden header failure message, got: {result['failures']}"
+
     def test_quote_warning_when_no_quotes(self):
         from src.content_generation.prompt_builder import validate_article_dynamic
         audit = _make_audit(has_direct_quotes=True)
@@ -456,6 +496,18 @@ class TestPreDryRunChecklist:
         r = _build_repair_instructions([], 500)
         assert "Review all rules" in r, \
             f"Expected fallback message, got:\n{r}"
+
+    def test_repair_instructions_forbidden_header(self):
+        """Forbidden-header failure string must route to a SECTION HEADER repair instruction."""
+        from src.content_generation.article_generator import _build_repair_instructions
+        r = _build_repair_instructions(
+            ["Forbidden generic section header: '## The Human Cost'. "
+             "Write a story-specific header naming the exact angle "
+             "of this section — never a category label."],
+            700,
+        )
+        assert "SECTION HEADER" in r, \
+            f"Expected SECTION HEADER in repair output, got:\n{r}"
 
     # Test C — max_tokens formula (Prompt 1)
     def test_max_tokens_formula_thin(self):
