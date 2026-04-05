@@ -153,7 +153,10 @@ def audit_source_material(articles: List[Dict], topic: str, client) -> AuditResu
         for n, article in enumerate(articles[:12], 1):
             source_name = article.get("source_name", "Unknown")
             heading = article.get("heading", "No headline")
-            story = article.get("story", "")[:1500]
+            # Aligned with extract_article_signals() which also reads 2000 chars.
+            # Mismatched lengths caused has_direct_quotes to be False for quotes
+            # appearing between chars 1500-2000, contradicting signal extraction.
+            story = article.get("story", "")[:2000]
             digest_parts.append(f"Source {n} ({source_name}): {heading}\n{story}")
         source_digest = "\n\n".join(digest_parts)
 
@@ -283,6 +286,72 @@ def format_timestamp(timezone: str = 'Asia/Kolkata') -> str:
 
 
 # ===========================================
+# RETRY REPAIR CLASSIFIER
+# ===========================================
+
+def _build_repair_instructions(failures: list, word_ceiling: int) -> str:
+    """
+    Map validation failure messages to targeted repair instructions
+    for the retry prompt. Each failure pattern gets a specific,
+    actionable instruction — not a generic "try again".
+    """
+    instructions = []
+
+    for failure in failures:
+        f_lower = failure.lower()
+
+        if "ceiling" in f_lower:
+            instructions.append(
+                f"• WORD CEILING: Your previous response exceeded "
+                f"{word_ceiling} words. For this attempt, write "
+                f"fewer paragraphs — cut the one that adds the least "
+                f"new information. Stop writing the moment you reach "
+                f"{word_ceiling} words. Do not summarise at the end."
+            )
+
+        elif "banned" in f_lower or any(
+            phrase in f_lower for phrase in [
+                "historic", "unprecedented", "crucial",
+                "landmark", "sparking", "amid"
+            ]
+        ):
+            instructions.append(
+                "• BANNED PHRASE: Your previous response contained "
+                "a banned phrase. Scan every sentence before writing "
+                "it. If you are about to write 'historic', "
+                "'unprecedented', 'crucial', 'landmark', 'sparking', "
+                "or 'amid' — stop and replace it with a specific "
+                "verified fact from the source material instead."
+            )
+
+        elif "short" in f_lower or "150" in f_lower:
+            instructions.append(
+                "• MINIMUM LENGTH: Your previous response was too short. "
+                "Develop the development and context sections further "
+                "using confirmed facts from SOURCE MATERIAL. "
+                "Do not add speculation — add confirmed detail."
+            )
+
+        elif "headline" in f_lower:
+            instructions.append(
+                "• HEADLINE: Your previous response had a missing or "
+                "too-short headline. Write a headline of at least "
+                "6 words in active voice: who did what."
+            )
+
+        else:
+            # Catch-all for any future failure type
+            instructions.append(
+                f"• GENERAL FAILURE: {failure[:120]}"
+            )
+
+    if not instructions:
+        return "Review all rules in the system message and retry."
+
+    return "\n".join(instructions)
+
+
+# ===========================================
 # MAIN GENERATION FUNCTION
 # ===========================================
 
@@ -359,7 +428,14 @@ def generate_article(
     }
 
     # Step 7 — Calculate max_tokens
-    max_tokens = min(2300, int(audit.honest_word_ceiling * 1.5) + 200)
+    # 1.35 tokens/word is empirical for Llama 3.3 on news prose.
+    # HEADLINE_OVERHEAD covers headline + subheadline + dateline tokens.
+    # This makes max_tokens a hard enforcement of the audit ceiling,
+    # not just a generous budget.
+    TOKENS_PER_WORD = 1.35
+    HEADLINE_OVERHEAD = 80
+    max_tokens = int(audit.honest_word_ceiling * TOKENS_PER_WORD) + HEADLINE_OVERHEAD
+    logger.debug(f"max_tokens set to {max_tokens} for ceiling {audit.honest_word_ceiling}w ({audit.source_quality})")
     
     logger.info(f"🖊️ Generating article for trend: '{topic}'")
     logger.info(f"   Sources: {len(source_articles)} articles")
@@ -370,9 +446,40 @@ def generate_article(
     # we avoid cycling back to an already-burned key within the same article.
     attempt = 0
     keys_tried_this_article: set = set()
+    last_validation_failures: list = []
+    # Tracks failure reasons from the previous attempt so the
+    # retry can send a targeted repair instruction.
     while attempt < max_retries:
         try:
-            # a) Call Groq API — always fetch current active client so rotation
+            # a) Compute per-attempt token budget and repair preamble.
+            # 10% reduction per retry adds hardware-level pressure on top of
+            # the textual repair instruction. Floor of 200 prevents the model
+            # being cut off so hard it cannot produce coherent output.
+            attempt_max_tokens = max(
+                200,
+                int(max_tokens * (0.9 ** attempt))
+            )
+
+            if attempt == 0 or not last_validation_failures:
+                current_user_prompt = user_prompt
+            else:
+                repair_instructions = _build_repair_instructions(
+                    last_validation_failures,
+                    audit.honest_word_ceiling
+                )
+                retry_preamble = (
+                    f"⚠️ PREVIOUS ATTEMPT FAILED — DO NOT REPEAT THESE ERRORS:\n"
+                    f"{repair_instructions}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                )
+                current_user_prompt = retry_preamble + user_prompt
+                logger.warning(
+                    f"🔁 Retry {attempt}/{max_retries - 1} — "
+                    f"injecting repair instructions: "
+                    f"{last_validation_failures[:2]}"
+                )
+
+            # b) Call Groq API — always fetch current active client so rotation
             #    picked up inside the exception handler is immediately visible.
             client = get_groq_client()
             if not client:
@@ -383,14 +490,14 @@ def generate_article(
                 model=model,
                 messages=[
                     {"role": "system", "content": system_msg},
-                    {"role": "user",   "content": user_prompt},
+                    {"role": "user",   "content": current_user_prompt},
                 ],
-                temperature=0.52,
-                max_tokens=max_tokens,
-                top_p=0.9,
+                temperature=0.35,
+                max_tokens=attempt_max_tokens,
+                top_p=0.95,
             )
             
-            # b) Extract generated text
+            # c) Extract generated text
             generated_text = response.choices[0].message.content
 
             if not generated_text:
@@ -398,7 +505,7 @@ def generate_article(
                 attempt += 1
                 continue
 
-            # b2) Post-generation phrase substitutions — applied before validation
+            # c2) Post-generation phrase substitutions — applied before validation
             # Replaces the most persistent banned phrases with safe semantic equivalents.
             # Only exact case-preserved matches; does not touch "historical", "Unprecedented" etc.
             _PHRASE_SUBS = [
@@ -419,7 +526,7 @@ def generate_article(
             for _old, _new in _PHRASE_SUBS:
                 generated_text = generated_text.replace(_old, _new)
 
-            # b3) Fix subtitle heading level — LLM sometimes writes `# Subtitle` or
+            # c3) Fix subtitle heading level — LLM sometimes writes `# Subtitle` or
             # `## Subtitle` inside a section body instead of the required `### Subtitle`.
             # Correct any single-hash line that appears after the article headline.
             _fixed_lines = []
@@ -435,7 +542,7 @@ def generate_article(
                     _fixed_lines.append(_line)
             generated_text = "\n".join(_fixed_lines)
 
-            # b4) Strip forbidden generic section headers — LLM may output ## Lead etc.
+            # c4) Strip forbidden generic section headers — LLM may output ## Lead etc.
             # despite FORMAT RULE. Custom story-specific ## headers are now intentional
             # and must NOT be stripped; only these specific blueprint labels are removed.
             _SECTION_HEADERS_TO_STRIP = {
@@ -449,7 +556,7 @@ def generate_article(
             ]
             generated_text = "\n".join(_cleaned_lines)
 
-            # b5) Strip incomplete final sentence — ensures article ends on a clean
+            # c5) Strip incomplete final sentence — ensures article ends on a clean
             # sentence boundary even when the LLM is cut by the token limit.
             _trimmed = generated_text.rstrip()
             if _trimmed and _trimmed[-1] not in {'.', '!', '?', '"', '\u201d', ')'}:
@@ -465,37 +572,39 @@ def generate_article(
                     generated_text = _trimmed[:_last_end + 1] + "\n"
                     logger.debug("b5) Trimmed incomplete final sentence from article.")
 
-            # c) Parse article
+            # d) Parse article
             article = parse_generated_article(generated_text)
-            
-            # d) Basic length check
+
+            # e) Basic length check
             word_count = len(article.get("story", "").split())
             if word_count < 150:
                 logger.warning(f"Article too short ({word_count} words), retrying...")
                 attempt += 1
                 continue
-            
-            # e) Validate with dynamic validator
+
+            # f) Validate with dynamic validator
             validation = validate_article_dynamic(article, audit)
-            
-            # f) Log all warnings
+
+            # g) Log all warnings
             for warning in validation.get("warnings", []):
                 logger.warning(f"Article validation warning: {warning}")
-            
-            # g) Handle validation failures
+
+            # h) Handle validation failures
             if not validation["passes"]:
                 for failure in validation["failures"]:
                     logger.warning(f"Article validation failure: {failure}")
+                last_validation_failures = validation.get("failures", [])
                 if attempt < max_retries - 1:
                     attempt += 1
                     continue
                 else:
                     logger.error(
-                        "Article failed validation after all retries"
+                        f"Article failed all {max_retries} validation attempts. "
+                        f"Final failures: {last_validation_failures}"
                     )
                     return None
             
-            # h) Validation passed — add metadata
+            # i) Validation passed — add metadata
             article.update({
                 "dateline": audit.primary_location.upper() if audit.primary_location else "INTERNATIONAL",
                 "topic": topic,
@@ -507,12 +616,13 @@ def generate_article(
                 "generated_at": datetime.utcnow().isoformat(),
                 "model_used": model,
                 "source_quality": audit.source_quality,
+                "honest_word_ceiling": audit.honest_word_ceiling,  # Stored so the dashboard can display ceiling vs actual word count.
                 "audit_sections": audit.available_sections,
                 "validation_warnings": validation.get("warnings", []),
                 "prompt_debug": prompt_debug,
             })
             
-            # i) Log success
+            # j) Log success
             logger.info(f"✅ Generated article: '{article['heading'][:60]}...'")
             logger.info(
                 f"   Words: {article['word_count']} | "
@@ -520,7 +630,7 @@ def generate_article(
                 f"Sections: {audit.available_sections}"
             )
             
-            # j) Return article
+            # k) Return article
             return article
         
         except Exception as e:

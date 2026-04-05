@@ -385,17 +385,14 @@ def extract_article_signals(articles: List[Dict]) -> Dict:
                 human_angle = sentence.strip()
                 human_angle_score = score
 
-        # ── Build source digest: 800 chars per source, strip extracted quotes ──
-        cleaned_story = story
-        # Remove already-extracted quoted text to avoid duplication in digest
-        for q in quotes:
-            cleaned_story = cleaned_story.replace(q["text"], "")
-        # Also strip residual quote characters left by removal
-        cleaned_story = re.sub(r'[\u201c\u201d""]\s*[\u201c\u201d""]', '', cleaned_story)
-
-        snippet = cleaned_story[:800].strip()
-        if not snippet:
-            snippet = story[:800].strip()  # fallback to original if cleaning left nothing
+        # ── Build source digest: 2000 chars per source, quotes kept in place ──
+        # Quotes are not stripped from the digest — they remain in context so the
+        # model sees them naturally within the source text. build_dynamic_prompt()
+        # also surfaces them prominently via quote_block and raw_quotes_block,
+        # injected BEFORE SOURCE MATERIAL so the model reads what it can quote
+        # verbatim before it encounters the full raw context. Do not strip quotes
+        # here without also removing those injection blocks in build_dynamic_prompt().
+        snippet = story[:2000].strip()
 
         digest_parts.append(
             f"Source {idx} ({source_name}, {location}):\n"
@@ -1067,8 +1064,97 @@ def build_dynamic_prompt(
     dateline = f"{city}, {now.strftime('%B')} {now.day}, {now.year}"
     source_digest = signals.get("source_digest", "")
 
+    # ── Build quote_block: structured, regex-extracted quotes ──
+    # Quotes remain in the source digest for context; this block surfaces them
+    # prominently BEFORE SOURCE MATERIAL so the model reads what it can quote
+    # verbatim before it encounters the full raw context.
+    quotes = signals.get("quotes", [])
+    if quotes and audit.has_direct_quotes:
+        lines = []
+        for i, q in enumerate(quotes, 1):
+            speaker = q.get("speaker", "unnamed official")
+            text = q.get("text", "").strip()
+            if text:
+                lines.append(f'{i}. "{text}" — {speaker}')
+        if lines:
+            quote_block = (
+                "DIRECT QUOTES EXTRACTED FROM SOURCES — "
+                "use these verbatim in the article body:\n"
+                + "\n".join(lines)
+                + "\n\nRule: After each quote you use, write exactly one "
+                "sentence explaining why that speaker said it at that "
+                "specific moment — not what they said, but what they "
+                "were trying to achieve or signal.\n\n"
+            )
+        else:
+            quote_block = ""
+    else:
+        quote_block = ""
+
+    # ── Build raw_quotes_block: sentence-level fallback for quotes the regex missed ──
+    # Catches quote structures where the speaker is identified in a prior sentence
+    # (e.g. "Koch said.\n'We had a collective expression of joy.'") that _QUOTE_RE
+    # cannot capture because the capitalised name does not follow the closing quote.
+    raw_quote_sentences = []
+    seen_texts = {q.get("text", "")[:40] for q in quotes}
+    for article in articles[:6]:
+        source_name = article.get("source_name", "Unknown")
+        story = article.get("story", "")
+        sentences = re.split(r'(?<=[.!?])\s+', story)
+        for sent in sentences:
+            has_quote_char = (
+                '"' in sent or
+                '\u201c' in sent or
+                '\u2018' in sent
+            )
+            if has_quote_char and len(sent) > 40:
+                fingerprint = sent.strip()[:40]
+                if fingerprint not in seen_texts:
+                    seen_texts.add(fingerprint)
+                    raw_quote_sentences.append(
+                        f"  [{source_name}]: {sent.strip()}"
+                    )
+    if raw_quote_sentences and audit.has_direct_quotes:
+        raw_quotes_block = (
+            "ADDITIONAL QUOTED SENTENCES FROM SOURCES "
+            "(regex extraction may have missed these — "
+            "use any direct speech found here):\n"
+            + "\n".join(raw_quote_sentences[:8])
+            + "\n\n"
+        )
+    else:
+        raw_quotes_block = ""
+
     is_rich = audit.source_quality == "rich"
     is_thin = audit.source_quality == "thin"
+
+    # Scale the number of required headers by source quality.
+    # Defined here (before system_message) to fix ordering: constraint_header
+    # uses header_count and must be assigned before system_message at line 1193.
+    if is_rich:
+        header_rule = "Use 4-5 ## section headers to divide the body (one before each major section)."
+    elif is_thin:
+        header_rule = "Use at most 1 ## section header, or none if the article is under 300 words."
+    else:
+        header_rule = "Use 2-3 ## section headers to divide the body."
+
+    # Numeric header count used in constraint blocks — must stay in sync with header_rule above
+    header_count = 5 if is_rich else (1 if is_thin else 3)
+
+    constraint_header = (
+        "NON-NEGOTIABLE LIMITS — enforced before any instruction below:\n"
+        f"1. Word ceiling: {audit.honest_word_ceiling}. "
+        f"   Stop writing when you reach {audit.honest_word_ceiling} words. "
+        "   This is not a target. Exceeding it is a hard failure.\n"
+        f"2. Section header (##) limit: {header_count}. "
+        f"   Writing more than {header_count} ## headers is a hard failure.\n"
+        f"3. Source quality assessed as: {audit.source_quality.upper()}. "
+        "   Write to the depth this quality supports — no more.\n"
+        f"4. Direct quotes confirmed in sources: {audit.has_direct_quotes}. "
+        + ("   Use them verbatim.\n" if audit.has_direct_quotes
+           else "   Do not fabricate or paraphrase as if quoting.\n")
+        + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
 
     # ── Section 3: Narrative ──
     if is_rich:
@@ -1196,7 +1282,7 @@ def build_dynamic_prompt(
         if is_thin else ""
     )
 
-    system_message = (
+    system_message = constraint_header + (
         "You are a senior wire service journalist with twenty years of "
         "field reporting experience writing for an educated general audience.\n\n"
         "BEFORE WRITING — identify silently:\n"
@@ -1266,17 +1352,9 @@ def build_dynamic_prompt(
     context_count = "2 paragraphs" if (audit.has_expert_opinion and is_rich) else "1 paragraph"
     stakes_count = "1-2 paragraphs" if (audit.has_impact_data and not is_thin) else "1 sentence"
 
-    # Scale the number of required headers by source quality
-    if is_rich:
-        header_rule = "Use 4-5 ## section headers to divide the body (one before each major section)."
-    elif is_thin:
-        header_rule = "Use at most 1 ## section header, or none if the article is under 300 words."
-    else:
-        header_rule = "Use 2-3 ## section headers to divide the body."
-
     user_prompt = f"""Write a news story about: {topic}
 {quality_warning}
-SOURCE MATERIAL:
+{quote_block}{raw_quotes_block}SOURCE MATERIAL:
 {source_digest}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1342,7 +1420,22 @@ RULES
 - No banned phrases
 - AP Style throughout
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FINAL REMINDER — CHECK BEFORE YOUR FIRST WORD:
+• Ceiling: {audit.honest_word_ceiling} words maximum. Count as you write. Stop when you reach it.
+• Headers: {header_count} ## header(s) maximum.
+• Banned word check: 'historic', 'unprecedented', 'crucial', 'landmark' must not appear anywhere in output.
+• Quotes: {audit.has_direct_quotes}. {"Direct quotes are available above. Use them." if audit.has_direct_quotes else "No quotes available. Do not invent any."}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Write now — output the headline, subheadline, dateline, then the story:"""
+
+    system_message += (
+        "\n\nFINAL CHECK BEFORE EACH PARAGRAPH: Read the first word of "
+        "the paragraph you just wrote. Your next paragraph MUST begin "
+        "with a different grammatical subject — a name, a number, a "
+        "country, a quote, a cause. If your last paragraph started with "
+        "'The', your next must not. Violating this is a hard failure."
+    )
 
     return system_message, user_prompt
 
@@ -1376,14 +1469,25 @@ def validate_article_dynamic(article: Dict, audit: AuditResult) -> Dict:
     if word_count < 150:
         failures.append(f"Article too short: {word_count} words (minimum 150)")
 
+    # Check 1b — Maximum word count (hard ceiling from audit)
+    ceiling_limit = audit.honest_word_ceiling + 50
+    if word_count > ceiling_limit:
+        failures.append(
+            f"Word ceiling exceeded: {word_count} words written, "
+            f"ceiling is {audit.honest_word_ceiling} "
+            f"(+50 tolerance = {ceiling_limit}). "
+            f"Trim the least essential paragraph and regenerate."
+        )
+
     # Check 2 — Headline present
     if len(article.get("heading", "").strip().split()) < 4:
         failures.append("Headline missing or too short")
 
     story = article.get("story", "")
 
-    # Check 3 — Accidental section headers (hard failure — LLM disobeyed FORMAT RULE)
-    # These should never appear in output; the LLM was instructed to write continuous prose.
+    # Check 3 — Accidental blueprint section headers (hard failure)
+    # These exact blueprint labels must never appear; they indicate the model
+    # echoed the writing template instead of writing story-specific headers.
     ACCIDENTAL_HEADERS = [
         "## Lead",
         "## What Happened",
@@ -1392,12 +1496,58 @@ def validate_article_dynamic(article: Dict, audit: AuditResult) -> Dict:
         "## Implications",
         "## What's Next",
         "## Key Facts",
+        "## Background",
     ]
     for h in ACCIDENTAL_HEADERS:
         if h in story:
             failures.append(
                 f"Accidental section header in prose: '{h}' — FORMAT RULE violated"
             )
+
+    # Check 3b — Generic non-story-specific headers (hard failure)
+    # The model is instructed to write headers that name the specific angle of
+    # THIS story. The following generic labels are forbidden regardless of
+    # whether they match the blueprint exactly.
+    GENERIC_HEADERS = {
+        "## The Human Cost",
+        "## What Comes Next",
+        "## The Background",
+        "## The Stakes",
+        "## The Context",
+        "## The Response",
+        "## The Fallout",
+        "## The Aftermath",
+        "## The Impact",
+        "## Analysis",
+        "## Context",
+        "## The Analysis",
+        "## The Implications",
+        "## Response",
+        "## What This Means",
+        "## Moving Forward",
+        "## Going Forward",
+        "## Looking Ahead",
+        "## The Bigger Picture",
+        "## The Bottom Line",
+    }
+    for line in story.splitlines():
+        stripped_line = line.strip()
+        if stripped_line in GENERIC_HEADERS:
+            failures.append(
+                f"Generic section header detected: '{stripped_line}' — "
+                "headers must name the specific story angle, not a generic label"
+            )
+
+    # Check 3c — Short (≤3 word) ## headers (warning — likely too generic)
+    for line in story.splitlines():
+        stripped_line = line.strip()
+        if stripped_line.startswith("## "):
+            header_words = stripped_line[3:].strip().split()
+            if len(header_words) <= 3:
+                warnings.append(
+                    f"Section header may be too generic (≤3 words): '{stripped_line}' — "
+                    "headers should name the specific story angle"
+                )
 
     # Check 4 — Quote presence when audit indicates quotes available
     if audit.has_direct_quotes:
