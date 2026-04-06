@@ -213,10 +213,44 @@ RULES:
         return audit_result
 
     except Exception as e:
-        # Step 5 — Fallback on any failure
-        logger.warning(f"Audit call failed ({e}), using default audit result")
+        error_msg = str(e)
+        # Detect daily TPD quota exhaustion — same patterns as generation loop
+        is_tpd = (
+            'tokens per day' in error_msg.lower()
+            or 'tpd' in error_msg.lower()
+            or bool(re.search(r'try again in \d+h', error_msg.lower()))
+        )
+        if is_tpd:
+            logger.warning(
+                "Audit TPD quota exhausted on current key — rotating and retrying once..."
+            )
+            rotated = rotate_groq_key("audit TPD quota exhausted")
+            if rotated:
+                retry_client = get_groq_client()
+                try:
+                    response = retry_client.chat.completions.create(
+                        model=model,
+                        response_format={"type": "json_object"},
+                        temperature=0.1,
+                        max_tokens=600,
+                        messages=[{"role": "user", "content": audit_prompt}],
+                    )
+                    data = _json.loads(response.choices[0].message.content)
+                    audit_result = AuditResult(**data)
+                    logger.info(
+                        f"📋 Audit (retry): quality={audit_result.source_quality} | "
+                        f"sections={audit_result.available_sections} | "
+                        f"ceiling={audit_result.honest_word_ceiling}w"
+                    )
+                    return audit_result
+                except Exception as retry_e:
+                    logger.warning(f"Audit retry also failed ({retry_e}), using fallback")
+
+        # Fallback: API unavailable — treat as adequate, not thin.
+        # "thin" is a confirmed quality verdict; a failed API call is not.
+        logger.warning(f"Audit call failed ({e}), using adequate fallback audit result")
         default_result = AuditResult(
-            available_sections=["what_happened", "key_facts", "background_context"],
+            available_sections=["what_happened", "key_facts", "background_context", "reactions"],
             has_direct_quotes=False,
             has_named_sources=False,
             has_statistics=False,
@@ -224,8 +258,8 @@ RULES:
             has_expert_opinion=False,
             has_impact_data=False,
             primary_location=None,
-            source_quality="thin",
-            honest_word_ceiling=400,
+            source_quality="adequate",
+            honest_word_ceiling=500,
         )
         logger.info(
             f"📋 Audit: quality={default_result.source_quality} | "
@@ -409,8 +443,8 @@ def generate_article(
     # Step 3 — Audit source material
     audit = audit_source_material(source_articles, topic, client)
     
-    # Step 4 — Hard stop: thin quality with insufficient sections
-    if audit.source_quality == "thin" and len(audit.available_sections) < 2:
+    # Step 4 — Hard stop: thin quality
+    if audit.source_quality == "thin":
         logger.warning(
             f"⏭️ Skipping '{topic}' — audit found insufficient material "
             f"(quality=thin, sections={audit.available_sections})"

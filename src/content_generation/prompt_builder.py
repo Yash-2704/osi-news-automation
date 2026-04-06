@@ -114,6 +114,9 @@ _FORBIDDEN_HEADERS: frozenset = frozenset({
     "analysis & context", "key facts", "lead",
     "the scale of the attacks", "the response from",
     "the broader implications", "the international response",
+    "the international community's response", "the economic cost of conflict",
+    "the role of", "the future of", "the broader picture",
+    "the context", "the significance", "the global implications",
 })
 
 
@@ -391,10 +394,36 @@ def extract_article_signals(articles: List[Dict]) -> Dict:
         # ── Extract quotes ──
         for match in _QUOTE_RE.finditer(story):
             quote_text = match.group(1).strip()
-            speaker = match.group(2).strip() if match.group(2) else "unnamed official"
+            # Fix 1 — Explainer-box filter: "What is X? X is ..." constructs
+            # are editorial copy paste, not attributable quotes. Only reject
+            # when >80 chars so short rhetorical questions ("What choice do we
+            # have?") are preserved.
+            if re.search(r'\?\s+[A-Z]', quote_text) and len(quote_text) > 80:
+                continue
+            open_pos = match.start()
+            pre_context = story[max(0, open_pos - 80):open_pos]
+            attribution_match = re.search(
+                r'([A-Za-z][^.!?]{5,60}?'
+                r'(?:said|stated|told|wrote|confirmed|warned|added'
+                r'|noted|declared|announced|reported))\s*[,:]?\s*$',
+                pre_context
+            )
+            if attribution_match:
+                speaker = attribution_match.group(1).strip()
+            elif match.group(2):
+                speaker = match.group(2).strip()
+            else:
+                speaker = pre_context.strip()[-40:].strip(' ,"\'')
+
+            # Drop quotes with no recoverable attribution — a quote
+            # with no speaker is worse than no quote at all.
+            if not speaker or len(speaker) < 4 or not any(c.isalpha() for c in speaker):
+                continue
+
             # Sanitise speaker: reject RSS navigation artifacts
             if speaker.lower().strip() in _INVALID_SPEAKERS:
-                speaker = "unnamed official"
+                continue
+
             # De-duplicate by checking if similar text already captured
             if not any(q["text"][:40] == quote_text[:40] for q in quotes):
                 quotes.append({"text": quote_text, "speaker": speaker})
@@ -1117,7 +1146,12 @@ def build_dynamic_prompt(
                 + "\n\nRule: After each quote you use, write exactly one "
                 "sentence explaining why that speaker said it at that "
                 "specific moment — not what they said, but what they "
-                "were trying to achieve or signal.\n\n"
+                "were trying to achieve or signal.\n"
+                "Use the attribution phrase provided with each quote exactly "
+                "as written. Do not replace it with \"unnamed official.\" If "
+                "the attribution says \"Tehran's central command stated,\" "
+                "write that. Preserve the sourcing language from the "
+                "original reporting.\n\n"
             )
         else:
             quote_block = ""
@@ -1364,6 +1398,15 @@ def build_dynamic_prompt(
         "she needed their attention before the session opened.' — this names "
         "a specific actor, a specific moment, and a specific strategic "
         "consequence that is unique to this quote at this time.\n"
+        "For unnamed officials specifically: do not write "
+        "'The official said this to emphasize X.' "
+        "Instead name the institutional consequence — which government, "
+        "which policy, which deadline their statement was directed at.\n"
+        "  BAD: 'The official said this to highlight the severity of "
+        "the situation.'\n"
+        "  GOOD: 'The statement came as the UN Security Council was "
+        "scheduled to vote on a resolution within 48 hours, making "
+        "public pressure the only remaining lever.'\n"
         "Cause rule: every cause you name must be followed by its effect in the next sentence.\n\n"
         "VARIATION RULE: Before writing each paragraph, look at the first word of the previous "
         "paragraph. Your new paragraph must open with a different subject, actor, or angle. "

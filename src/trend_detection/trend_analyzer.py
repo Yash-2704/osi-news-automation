@@ -216,7 +216,7 @@ def extract_topic_name(articles: List[Dict]) -> str:
 
 def detect_trends(
     articles: List[Dict],
-    top_n: int = 20,
+    top_n: int = 10,
     min_cluster_size: int = 2,
     similarity_threshold: float = 0.3
 ) -> List[Dict]:

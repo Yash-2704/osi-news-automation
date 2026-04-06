@@ -359,7 +359,7 @@ def run_pipeline(dry_run: bool = False) -> dict:
             return stats
         # ─────────────────────────────────────────────────────────────────
 
-        top_n_trends = int(os.getenv('TOP_TRENDS_COUNT', 15))
+        top_n_trends = int(os.getenv('TOP_TRENDS_COUNT', 10))
         min_cluster_size = int(os.getenv('MIN_CLUSTER_SIZE', 2))
         # Read a dedicated clustering threshold — reusing the duplicate
         # detection threshold (0.8) produces distance_threshold=0.20
