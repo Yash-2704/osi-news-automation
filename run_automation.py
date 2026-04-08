@@ -20,6 +20,7 @@ Usage:
 
 import sys
 import os
+import re
 import subprocess
 import argparse
 import json
@@ -107,6 +108,111 @@ def setup_logging():
 
 
 # ===========================================
+# ARTICLE & PROMPT FILE SAVING
+# ===========================================
+
+def _make_slug(topic: str) -> str:
+    """Convert a topic string to a safe filename slug."""
+    slug = topic.lower()
+    slug = re.sub(r'[^a-z0-9\s-]', '', slug)
+    slug = re.sub(r'\s+', '-', slug.strip())
+    return slug[:50].rstrip('-')
+
+
+def save_article_to_file(article: dict, session_id: str) -> None:
+    """Save a generated article as a Markdown file under output/articles/YYYY-MM-DD/."""
+    try:
+        generated_at = article.get('generated_at', datetime.now().isoformat())
+        date_str = generated_at[:10]  # YYYY-MM-DD
+        slug = _make_slug(article.get('topic', 'untitled'))
+        trend_idx = article.get('trend_index', 0)
+
+        articles_dir = Path("output/articles") / date_str
+        articles_dir.mkdir(parents=True, exist_ok=True)
+
+        filename = f"{session_id}_{trend_idx+1:02d}_{slug}.md"
+        filepath = articles_dir / filename
+
+        sources = article.get('sources_used', [])
+        sources_str = ', '.join(sources) if sources else 'unknown'
+
+        frontmatter = (
+            f"---\n"
+            f"session_id: {session_id}\n"
+            f"topic: {article.get('topic', '')}\n"
+            f"generated_at: {generated_at}\n"
+            f"word_count: {article.get('word_count', 0)}\n"
+            f"source_count: {article.get('source_count', 0)}\n"
+            f"source_quality: {article.get('source_quality', '')}\n"
+            f"sources_used: [{sources_str}]\n"
+            f"model_used: {article.get('model_used', '')}\n"
+            f"---\n\n"
+        )
+
+        heading = article.get('heading', '')
+        sub_heading = article.get('sub_heading', '')
+        story = article.get('story', '')
+
+        body = f"# {heading}\n\n"
+        if sub_heading:
+            body += f"### {sub_heading}\n\n"
+        body += story
+
+        filepath.write_text(frontmatter + body, encoding='utf-8')
+        logger.debug(f"📄 Article saved: {filepath}")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not save article file: {e}")
+
+
+def save_prompt_to_file(article: dict, session_id: str) -> None:
+    """Save the prompt debug info as a Markdown file under output/prompts/YYYY-MM-DD/."""
+    prompt_debug = article.get('prompt_debug')
+    if not prompt_debug:
+        return
+    try:
+        generated_at = article.get('generated_at', datetime.now().isoformat())
+        date_str = generated_at[:10]
+        slug = _make_slug(article.get('topic', 'untitled'))
+        trend_idx = article.get('trend_index', 0)
+
+        prompts_dir = Path("output/prompts") / date_str
+        prompts_dir.mkdir(parents=True, exist_ok=True)
+
+        filename = f"{session_id}_{trend_idx+1:02d}_{slug}_prompt.md"
+        filepath = prompts_dir / filename
+
+        frontmatter = (
+            f"---\n"
+            f"session_id: {session_id}\n"
+            f"topic: {article.get('topic', '')}\n"
+            f"captured_at: {prompt_debug.get('captured_at', generated_at)}\n"
+            f"model: {prompt_debug.get('model', '')}\n"
+            f"source_count: {prompt_debug.get('source_count', 0)}\n"
+            f"audit_quality: {prompt_debug.get('audit_quality', '')}\n"
+            f"audit_sections: {prompt_debug.get('audit_sections', [])}\n"
+            f"---\n\n"
+        )
+
+        system_msg = prompt_debug.get('system_message', '')
+        user_prompt = prompt_debug.get('user_prompt', '')
+
+        content = (
+            frontmatter
+            + "## SYSTEM MESSAGE\n\n"
+            + system_msg
+            + "\n\n---\n\n"
+            + "## USER PROMPT\n\n"
+            + user_prompt
+            + "\n"
+        )
+
+        filepath.write_text(content, encoding='utf-8')
+        logger.debug(f"📄 Prompt saved: {filepath}")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not save prompt file: {e}")
+
+
+# ===========================================
 # PIPELINE EXECUTION
 # ===========================================
 
@@ -149,6 +255,7 @@ def run_pipeline(dry_run: bool = False) -> dict:
         if not db.connect():
             raise Exception("Failed to connect to MongoDB")
         logger.info("✅ Database connected")
+        run_number = db.sessions.count_documents({})
         
         # Initialize image generation (if enabled)
         if os.getenv('ENABLE_IMAGE_GENERATION', 'false').lower() == 'true' and not dry_run:
@@ -162,10 +269,15 @@ def run_pipeline(dry_run: bool = False) -> dict:
         logger.info("📰 STEP 1: SCRAPING NEWS ARTICLES")
         logger.info("=" * 80)
         
-        max_articles = int(os.getenv('MAX_ARTICLES_PER_RUN', 50))
-        logger.info(f"Target: {max_articles} articles")
-        
-        articles = scrape_news_batch(max_articles=max_articles)
+        max_articles = int(os.getenv('MAX_ARTICLES_PER_RUN', 9999))
+        per_source_limit = int(os.getenv('PER_SOURCE_ARTICLE_LIMIT', 10))
+        logger.info(f"Per-source limit: {per_source_limit} articles | Sources loaded: see below")
+
+        articles = scrape_news_batch(
+            max_articles=max_articles,
+            max_per_source=per_source_limit,
+            run_number=run_number
+        )
         
         if not articles:
             logger.error("❌ No articles scraped. Aborting pipeline.")
@@ -188,14 +300,75 @@ def run_pipeline(dry_run: bool = False) -> dict:
         logger.info("\n" + "=" * 80)
         logger.info("🔍 STEP 2: DETECTING TRENDING TOPICS")
         logger.info("=" * 80)
-        
-        top_n_trends = int(os.getenv('TOP_TRENDS_COUNT', 5))
-        min_cluster_size = int(os.getenv('MIN_CLUSTER_SIZE', 1))
-        similarity_threshold = float(os.getenv('DUPLICATE_SIMILARITY_THRESHOLD', 0.6))
+
+        # ── Pre-clustering noise filter ──────────────────────────────────
+        # Drop articles that would pollute the embedding space and prevent
+        # genuine topics from clustering. Three classes of noise removed:
+        #   1. Too short  — weather bulletins, video captions, paywall stubs
+        #   2. Non-English — foreign-language articles from AFP etc.
+        #   3. Paywall stubs — articles whose content is just the domain URL
+        MIN_ARTICLE_WORDS = int(os.getenv('MIN_ARTICLE_WORDS', 150))
+        articles_before_filter = len(articles)
+        clustering_articles = []
+        skipped_short = 0
+        skipped_nonenglish = 0
+        skipped_stub = 0
+
+        try:
+            from langdetect import detect as _detect_lang
+            _lang_available = True
+        except ImportError:
+            _lang_available = False
+            logger.warning("langdetect not available — skipping language filter")
+
+        for art in articles:
+            story = art.get('story', '')
+            word_count = len(story.split())
+
+            # 1. Word-count floor
+            if word_count < MIN_ARTICLE_WORDS:
+                skipped_short += 1
+                continue
+
+            # 2. Paywall stub — content is just a domain URL (e.g. "www.dailymaverick.co.za")
+            stripped = story.strip()
+            if stripped.startswith('www.') or stripped.startswith('http'):
+                skipped_stub += 1
+                continue
+
+            # 3. Language detection — keep only English
+            if _lang_available:
+                try:
+                    sample = (art.get('heading', '') + ' ' + story[:400]).strip()
+                    if sample and _detect_lang(sample) != 'en':
+                        skipped_nonenglish += 1
+                        continue
+                except Exception:
+                    pass  # langdetect can fail on very short texts — keep article
+
+            clustering_articles.append(art)
+
+        logger.info(
+            f"🧹 Pre-filter: {articles_before_filter} → {len(clustering_articles)} articles "
+            f"(dropped {skipped_short} short, {skipped_stub} stubs, {skipped_nonenglish} non-English)"
+        )
+
+        if not clustering_articles:
+            logger.error("❌ All articles filtered out before clustering. Aborting.")
+            stats['errors'].append("All articles removed by pre-filter")
+            return stats
+        # ─────────────────────────────────────────────────────────────────
+
+        top_n_trends = int(os.getenv('TOP_TRENDS_COUNT', 10))
+        min_cluster_size = int(os.getenv('MIN_CLUSTER_SIZE', 2))
+        # Read a dedicated clustering threshold — reusing the duplicate
+        # detection threshold (0.8) produces distance_threshold=0.20
+        # which is too tight and collapses unrelated topics into singletons.
+        similarity_threshold = float(os.getenv('CLUSTER_SIMILARITY_THRESHOLD', 0.62))
 
         # Use the actual NLP clustering from trend_analyzer to group similar stories into single trends
         trends = detect_trends(
-            articles,
+            clustering_articles,
             top_n=top_n_trends,
             min_cluster_size=min_cluster_size,
             similarity_threshold=similarity_threshold
@@ -223,6 +396,71 @@ def run_pipeline(dry_run: bool = False) -> dict:
         
         for i, trend in enumerate(trends):
             logger.info(f"\n📝 Processing trend {i+1}/{len(trends)}: {trend['topic']}")
+            
+            # ── Single-source guard ──
+            # Never generate from fewer than 2 source articles.
+            # A single-source article cannot be honestly synthesized
+            # to 800+ words — the model will fabricate to fill the gap.
+            source_count = len(trend.get('articles', []))
+            if source_count < 2:
+                logger.warning(
+                    f"⏭️  Skipping '{trend['topic']}' — "
+                    f"only {source_count} source(s). "
+                    f"Minimum 2 required for honest synthesis."
+                )
+                stats['errors'].append(
+                    f"Skipped (single source): {trend['topic']}"
+                )
+                continue
+
+            # ── Unique-sources guard ──
+            # Require articles from at least 2 different source outlets.
+            # Multiple articles from the same outlet do not provide the
+            # independent corroboration needed for honest synthesis.
+            unique_sources = {a.get('source_name') for a in trend.get('articles', [])}
+            if len(unique_sources) < 2:
+                logger.warning(
+                    f"⏭️  Skipping '{trend['topic']}' — "
+                    f"only {len(unique_sources)} unique source(s). "
+                    f"Multiple independent sources required."
+                )
+                stats['errors'].append(
+                    f"Skipped (single unique source): {trend['topic']}"
+                )
+                continue
+
+            # Guard: skip clusters whose total source words are too few to
+            # reach the 700-word minimum without fabrication.
+            total_source_words = sum(
+                len(a.get('story', '').split())
+                for a in trend.get('articles', [])
+            )
+            if total_source_words < 400:
+                logger.warning(
+                    f"⏭️  Skipping '{trend['topic']}' — "
+                    f"insufficient source material "
+                    f"({total_source_words} words total). "
+                    f"Minimum 400 required."
+                )
+                stats['errors'].append(
+                    f"Skipped (thin sources): {trend['topic']}"
+                )
+                continue
+
+            # Guard: skip clusters with low internal similarity — sources
+            # are likely unrelated and will produce contaminated output.
+            avg_sim = trend.get('avg_similarity', 0.0)
+            COHERENCE_FLOOR = float(os.getenv('COHERENCE_FLOOR', '0.58'))
+            if avg_sim < COHERENCE_FLOOR:
+                logger.warning(
+                    f"⏭️  Skipping '{trend['topic']}' — "
+                    f"low cluster coherence ({avg_sim:.2f}). "
+                    f"Sources likely unrelated."
+                )
+                stats['errors'].append(
+                    f"Skipped (incoherent cluster): {trend['topic']}"
+                )
+                continue
             
             try:
                 # Generate article
@@ -260,7 +498,11 @@ def run_pipeline(dry_run: bool = False) -> dict:
                 # Save to database
                 article_id = db.save_article(article)
                 article['_id'] = article_id
-                
+
+                # Save article and prompt to filesystem
+                save_article_to_file(article, session_id)
+                save_prompt_to_file(article, session_id)
+
             except Exception as e:
                 logger.error(f"❌ Error generating article for trend '{trend['topic']}': {e}")
                 stats['errors'].append(f"Article generation error: {str(e)}")
@@ -505,6 +747,9 @@ Examples:
     logger.info("OSI News Automation System v1.0")
     logger.info(f"Mode: {args.mode}")
     logger.info(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(
+        f"GROQ_MODEL: {os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')}"
+    )
     
     try:
         if args.mode == 'once':

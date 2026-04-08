@@ -6,12 +6,14 @@ services:
     repo: https://github.com/Jkavya100/osi-news-automation
     branch: main
     schedule: "0 */3 * * *"       # every 3 hours (UTC)
-    buildCommand: pip install -r requirements-render.txt
+    buildCommand: pip install -r requirements-render.txt && scrapling install
     startCommand: python run_automation.py --mode once
     envVars:
       # ---- Groq LLM ----
       - key: GROQ_API_KEY
         sync: false
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
       # ---- HuggingFace ----
       - key: HF_ACCESS_TOKEN
         sync: false
@@ -49,6 +51,10 @@ services:
         value: "5"
       - key: TOP_TRENDS_COUNT
         value: "2"
+      - key: CLUSTER_SIMILARITY_THRESHOLD
+        value: "0.62"
+      - key: MIN_CLUSTER_SIZE
+        value: "2"
       - key: ARTICLE_MIN_WORDS
         value: "800"
       - key: SCRAPING_INTERVAL_HOURS
@@ -56,3 +62,6 @@ services:
       # ---- Python ----
       - key: PYTHONUNBUFFERED
         value: "1"
+      # ---- Guardian API ----
+      - key: GUARDIAN_API_KEY
+        sync: false

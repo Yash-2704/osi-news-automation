@@ -90,7 +90,7 @@ def check_groq_api():
         
         # Simple test request
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile'),
             messages=[{"role": "user", "content": "test"}],
             max_tokens=5
         )

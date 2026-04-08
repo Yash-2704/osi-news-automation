@@ -1,5 +1,7 @@
 """
-Test the updated formatting function to ensure consistent fonts on Hocalwire.
+Test the updated formatting function for semantic HTML output.
+
+Covers: ## headers, key facts bullet list, **bold** inline, body paragraphs.
 """
 
 import sys
@@ -9,33 +11,54 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from src.api_integrations.hocalwire_uploader import format_article_for_cms
 
-# Sample article with markdown formatting (like your generated articles)
-sample_story = """India's parliament passed a landmark climate bill today, committing the nation to net-zero emissions by 2070.
+# ── Sample article covering all four formatting scenarios ──
+sample_story = """HAWAII, March 22 – A powerful flash flooding event has struck Oahu.
 
-## Key Provisions
+**Key facts:**
+- Evacuation orders affect 5,500 people.
+- Flooding is the worst in 20 years.
+- At least 200 people rescued.
+- 10 hospitalized with hypothermia.
 
-The legislation includes mandatory renewable energy targets for all major industries and establishes a national carbon trading system.
+## The Event
 
-## Political Response
+The flash flooding began **early Saturday morning**, with heavy rains pounding
+the north shore of Oahu.
 
-Opposition parties praised the bipartisan effort, while environmental groups called for more aggressive timelines.
+## Damage and Casualties
 
-## Economic Impact
+At least 200 people have been rescued. Fortunately, no deaths reported.
 
-Economists predict the transition will create millions of green jobs while requiring significant infrastructure investment over the next decade.
+## Context and Analysis
 
-The bill now awaits presidential approval before becoming law."""
+The flooding highlights the importance of **infrastructure resilience**.
 
-# Test formatting
-formatted_html = format_article_for_cms(sample_story)
+## What Happens Next
 
-print("="*80)
-print("FORMATTED HTML OUTPUT FOR HOCALWIRE")
-print("="*80)
-print("\n" + formatted_html + "\n")
-print("="*80)
-print("\nKEY CHANGES:")
-print("- Subheadings converted to <p><strong> (NOT <h2>)")
-print("- All text uses same paragraph formatting")
-print("- Consistent font styling on Hocalwire")
-print("="*80)
+FEMA is scheduled to conduct a damage assessment on March 25."""
+
+# ── Run formatter ──
+formatted = format_article_for_cms(sample_story)
+
+print("=" * 80)
+print("FORMATTED HTML OUTPUT")
+print("=" * 80)
+print()
+print(formatted)
+print()
+print("=" * 80)
+
+# ── Assertions ──
+assert "<h2" in formatted,       "FAIL: no <h2> tags — header conversion missing"
+assert "<ul" in formatted,       "FAIL: no <ul> — bullet list conversion missing"
+assert "<li" in formatted,       "FAIL: no <li> — list items missing"
+assert "<strong>" in formatted,  "FAIL: no <strong> — bold conversion missing"
+assert "- " not in formatted,    "FAIL: raw dash-space still present"
+assert "**" not in formatted,    "FAIL: raw bold markers still present"
+
+print("✅ All assertions passed")
+
+# ── Edge case: empty input ──
+assert format_article_for_cms("") == "", "FAIL: empty input should return empty string"
+assert format_article_for_cms(None) == "", "FAIL: None input should return empty string"
+print("✅ Edge case assertions passed (empty/None input)")
