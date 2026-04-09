@@ -2,6 +2,7 @@
 # Stripped of local-only packages (torch, diffusers, playwright, social media SDKs)
 # that are not needed in cloud mode.
 # Web Scraping
+newspaper3k==0.2.8
 beautifulsoup4==4.12.2
 lxml>=5.3.0
 requests==2.31.0
