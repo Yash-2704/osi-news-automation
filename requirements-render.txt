@@ -3,7 +3,7 @@
 # that are not needed in cloud mode.
 # Web Scraping
 beautifulsoup4==4.12.2
-lxml==4.9.3
+lxml>=5.3.0
 requests==2.31.0
 feedparser==6.0.10
 langdetect==1.0.9
@@ -12,7 +12,7 @@ curl_cffi==0.13.0
 selectolax==0.4.7
 tenacity==9.1.2
 httpx==0.28.1
-lxml_html_clean==0.4.4
+lxml_html_clean>=0.4.4
 scrapling[all]
 
 # NLP & ML — duplicate detection via sentence embeddings
