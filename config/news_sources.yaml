@@ -800,7 +800,7 @@ sources:
       headline: h1#Title
       content: div#Content
     priority: 3
-    enabled: true
+    enabled: false
     rate_limit_delay: 3
   - name: Japan Times
     url: https://www.japantimes.co.jp
@@ -860,7 +860,7 @@ sources:
       headline: h1.story__headline
       content: div.story__body
     priority: 3
-    enabled: true
+    enabled: false
     rate_limit_delay: 3
   - name: Jakarta Post
     url: https://www.thejakartapost.com
@@ -1040,7 +1040,7 @@ sources:
       headline: ''
       content: ''
     priority: 3
-    enabled: true
+    enabled: false
     rate_limit_delay: 4
   - name: The Edge Malaysia
     url: https://theedgemalaysia.com
@@ -1160,7 +1160,7 @@ sources:
       headline: ''
       content: ''
     priority: 3
-    enabled: true
+    enabled: false
     rate_limit_delay: 2
   - name: Saudi Gazette
     url: https://www.saudigazette.com.sa
